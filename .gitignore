@@ -1,0 +1,26 @@
+# ===== 민감정보 (절대 커밋 금지) =====
+.env
+*.env
+token.dat
+*.dat
+
+# ===== 데이터/로그 =====
+*.db
+*.sqlite
+trades.db
+logs/
+
+# ===== 파이썬 캐시 =====
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# ===== PyInstaller 빌드 산출물 =====
+build/
+dist/
+*.spec
+
+# ===== 기타 =====
+__synctest.txt
+.DS_Store

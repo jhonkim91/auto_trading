@@ -1,0 +1,12 @@
+# 한국투자증권 자동매매 프로그램 의존성 (Python 3.11 권장)
+requests>=2.32
+websocket-client>=1.8
+pandas>=2.0
+numpy>=1.24
+finance-datareader>=0.9.50
+pykrx>=1.0.45
+python-telegram-bot>=20.7
+APScheduler>=3.10
+PyYAML>=6.0
+python-dotenv>=1.0
+cryptography>=43.0

@@ -1,0 +1,45 @@
+# ============================================================
+#  자동매매 전략 / 리스크 설정
+#  민감정보(앱키 등)는 .env 에, 전략 파라미터는 여기에 둡니다.
+# ============================================================
+
+# 감시할 종목 목록
+universe:
+  # 국내주식: 6자리 종목코드
+  domestic:
+    - "005930"   # 삼성전자
+    - "000660"   # SK하이닉스
+    - "035720"   # 카카오
+  # 해외주식(미국): 심볼 + 거래소코드(NAS/NYS/AMS)
+  overseas:
+    - { symbol: "AAPL", exchange: "NAS" }
+    - { symbol: "TSLA", exchange: "NAS" }
+
+# 매매 엔진
+engine:
+  loop_interval_sec: 60          # 시그널 점검 주기(초)
+  domestic_session: "09:00-15:20"  # 국내장 자동매매 시간
+  overseas_session: "23:30-06:00"  # 미국장(한국시간, 서머타임 무시 단순값)
+  auto_trade_enabled: true       # false 면 시그널 알림만 (반자동)
+
+# 종합 시그널 전략 가중치 (점수 합산 방식)
+# 각 지표가 매수/매도 점수를 내고, 임계치를 넘으면 주문
+strategy:
+  buy_threshold: 2               # 매수 점수 합이 이 값 이상이면 매수
+  sell_threshold: 2              # 매도 점수 합이 이 값 이상이면 매도
+  indicators:
+    ma_cross:    { enabled: true,  short: 5,  long: 20,  weight: 1 }
+    rsi:         { enabled: true,  period: 14, low: 30, high: 70, weight: 1 }
+    macd:        { enabled: true,  fast: 12, slow: 26, signal: 9, weight: 1 }
+    bollinger:   { enabled: true,  period: 20, num_std: 2.0, weight: 1 }
+    vol_breakout: { enabled: true, k: 0.5, weight: 2 }   # 래리 윌리엄스 변동성 돌파
+
+# 리스크 관리
+risk:
+  max_positions: 5               # 동시 보유 최대 종목 수
+  risk_per_trade_pct: 1.0        # 거래당 계좌대비 위험 비율(%) - ATR 기반 포지션 사이징
+  stop_loss_pct: 5.0             # 손절 라인(%)
+  take_profit_pct: 10.0          # 익절 라인(%)
+  daily_loss_limit_pct: 3.0      # 일일 손실 한도(%) 도달 시 당일 매매 중단
+  max_drawdown_pct: 15.0         # 누적 MDD 한도(%) 도달 시 전체 청산 알림
+  atr_period: 14
