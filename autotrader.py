@@ -77,8 +77,26 @@ DEFAULT_CONFIG = {
         "overseas_session": "23:30-06:00",
         "auto_trade_enabled": True,
     },
+    "screener": {
+        "enabled": True,        # True면 고정 universe 대신 시장 전체에서 자동 발굴
+        "market": "all",        # 국내: all / kospi / kosdaq
+        "pool_size": 30,        # 후보 수
+        "top_k": 15,            # 심층 전략분석할 상위 모멘텀 종목 수(유량 보호)
+        "min_price": 2000,      # 국내 동전주 제외(원)
+        "max_price": 500000,    # 국내(원)
+        "momentum_rank": True,  # 등락률 기준 모멘텀 정렬
+        # --- 미국장(USD 기준) ---
+        "overseas_market": "NAS",      # NAS / NYS / AMS
+        "overseas_min_price": 5,       # USD
+        "overseas_max_price": 1000,    # USD
+        "overseas_pool": ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "GOOGL",
+                          "META", "AMD", "NFLX", "AVGO", "PLTR", "COIN"],  # 조건검색 실패시 후보풀
+        # True: 통합증거금(원화로 미국매수, 자동환전) 기준 매수가능금액 사용
+        # False: USD 예수금만 사용(사전 환전 방식)
+        "overseas_use_buyable": True,
+    },
     "strategy": {
-        "buy_threshold": 2,
+        "buy_threshold": 3,
         "sell_threshold": 2,
         "indicators": {
             "ma_cross": {"enabled": True, "short": 5, "long": 20, "weight": 1},
@@ -86,6 +104,9 @@ DEFAULT_CONFIG = {
             "macd": {"enabled": True, "fast": 12, "slow": 26, "signal": 9, "weight": 1},
             "bollinger": {"enabled": True, "period": 20, "num_std": 2.0, "weight": 1},
             "vol_breakout": {"enabled": True, "k": 0.5, "weight": 2},
+            "new_high": {"enabled": True, "period": 60, "weight": 1},
+            "adx": {"enabled": True, "period": 14, "min": 20, "penalty": 1},
+            "regime": {"enabled": True, "ma": 60},
         },
     },
     "risk": {
@@ -93,6 +114,8 @@ DEFAULT_CONFIG = {
         "risk_per_trade_pct": 1.0,
         "stop_loss_pct": 5.0,
         "take_profit_pct": 10.0,
+        "trailing_stop_pct": 4.0,
+        "cooldown_min": 30,
         "daily_loss_limit_pct": 3.0,
         "max_drawdown_pct": 15.0,
         "atr_period": 14,
@@ -139,6 +162,7 @@ class Settings:
     risk: dict = field(default_factory=dict)
     engine: dict = field(default_factory=dict)
     universe: dict = field(default_factory=dict)
+    screener: dict = field(default_factory=dict)
 
     @property
     def is_paper(self):
@@ -205,7 +229,8 @@ def load_settings():
 
     return Settings(mode, ak, sk, no, prod, g("TELEGRAM_BOT_TOKEN"), allowed,
                     cfg.get("strategy", {}), cfg.get("risk", {}),
-                    cfg.get("engine", {}), cfg.get("universe", {}))
+                    cfg.get("engine", {}), cfg.get("universe", {}),
+                    cfg.get("screener", {}))
 
 
 def update_env(updates):
@@ -473,6 +498,37 @@ class KISApi:
         return {"cash": float(summ.get("dnca_tot_amt", 0) or 0),
                 "total_eval": float(summ.get("tot_evlu_amt", 0) or 0), "positions": pos}
 
+    def domestic_volume_rank(self, market="all", count=30):
+        """거래량 순위(시장 전체 스크리너용). 한 번 호출로 활발한 종목 다수 반환."""
+        iscd = {"all": "0000", "kospi": "0001", "kosdaq": "1001"}.get(market, "0000")
+        params = {
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_COND_SCR_DIV_CODE": "20171",
+            "FID_INPUT_ISCD": iscd,
+            "FID_DIV_CLS_CODE": "0",
+            "FID_BLNG_CLS_CODE": "0",          # 0 평균거래량
+            "FID_TRGT_CLS_CODE": "111111111",
+            "FID_TRGT_EXLS_CLS_CODE": "0000000000",
+            "FID_INPUT_PRICE_1": "",
+            "FID_INPUT_PRICE_2": "",
+            "FID_VOL_CNT": "",
+            "FID_INPUT_DATE_1": "",
+        }
+        d = self._get("/uapi/domestic-stock/v1/quotations/volume-rank", "FHPST01710000", params)
+        out = []
+        for r in (d.get("output") or [])[:count]:
+            code = r.get("mksc_shrn_iscd")
+            if not code:
+                continue
+            out.append({
+                "code": code,
+                "name": r.get("hts_kor_isnm", code),
+                "price": float(r.get("stck_prpr", 0) or 0),
+                "change_rate": float(r.get("prdy_ctrt", 0) or 0),
+                "volume": int(float(r.get("acml_vol", 0) or 0)),
+            })
+        return out
+
     # ---- 해외(미국) ---- #
     _OVRS = {"NAS": "NASD", "NYS": "NYSE", "AMS": "AMEX"}
 
@@ -515,6 +571,82 @@ class KISApi:
         ok = d.get("rt_cd") == "0"
         log.info("해외주문 %s %s x%d -> %s %s", side, sym, qty, d.get("rt_cd"), d.get("msg1"))
         return {"ok": ok, "raw": d, "msg": d.get("msg1", "")}
+
+    def overseas_balance(self, exch="NAS"):
+        """미국 잔고(USD). 반환: {cash(USD 예수금), positions:[...]}"""
+        tr = "VTTS3012R" if self.s.is_paper else "TTTS3012R"
+        params = {
+            "CANO": self.s.account_no, "ACNT_PRDT_CD": self.s.account_prod,
+            "OVRS_EXCG_CD": self._OVRS.get(exch, "NASD"), "TR_CRCY_CD": "USD",
+            "CTX_AREA_FK200": "", "CTX_AREA_NK200": "",
+        }
+        d = self._get("/uapi/overseas-stock/v1/trading/inquire-balance", tr, params)
+        pos = []
+        for r in (d.get("output1") or []):
+            qty = int(float(r.get("ovrs_cblc_qty", 0) or 0))
+            if qty <= 0:
+                continue
+            pos.append({
+                "code": r.get("ovrs_pdno"), "name": r.get("ovrs_item_name"),
+                "qty": qty, "avg_price": float(r.get("pchs_avg_pric", 0) or 0),
+                "cur_price": float(r.get("now_pric2", 0) or 0),
+                "pnl_rate": float(r.get("evlu_pfls_rt", 0) or 0),
+                "pnl_amt": float(r.get("frcr_evlu_pfls_amt", 0) or 0),
+            })
+        summ = d.get("output2") or {}
+        if isinstance(summ, list):
+            summ = summ[0] if summ else {}
+        cash = float(summ.get("frcr_dncl_amt_2") or summ.get("frcr_dncl_amt1")
+                     or summ.get("frcr_buy_psbl_amt1") or 0)
+        return {"cash": cash, "positions": pos}
+
+    def overseas_buyable(self, sym, price, exch="NAS"):
+        """해외주식 매수가능금액 조회(통합증거금·환율 반영).
+        반환: {amount: 주문가능 USD, qty: 주문가능 수량}"""
+        tr = "VTTS3007R" if self.s.is_paper else "TTTS3007R"
+        params = {
+            "CANO": self.s.account_no, "ACNT_PRDT_CD": self.s.account_prod,
+            "OVRS_EXCG_CD": self._OVRS.get(exch, "NASD"),
+            "OVRS_ORD_UNPR": f"{price:.2f}", "ITEM_CD": sym,
+        }
+        d = self._get("/uapi/overseas-stock/v1/trading/inquire-psamount", tr, params)
+        o = d.get("output") or {}
+        if isinstance(o, list):
+            o = o[0] if o else {}
+        amount = float(o.get("ord_psbl_frcr_amt") or o.get("frcr_ord_psbl_amt1")
+                       or o.get("ovrs_ord_psbl_amt") or 0)
+        qty = int(float(o.get("ovrs_ord_psbl_qty") or o.get("ord_psbl_qty")
+                        or o.get("max_ord_psbl_qty") or 0))
+        return {"amount": amount, "qty": qty}
+
+    def overseas_search(self, exch="NAS", min_price=0, max_price=0, count=30):
+        """미국 조건검색(시장 전체 스크리너). 가격대 조건으로 후보 리스트 반환."""
+        params = {
+            "AUTH": "", "EXCD": exch,
+            "CO_YN_PRICECUR": "1" if (min_price or max_price) else "0",
+            "CO_ST_PRICECUR": str(min_price or ""), "CO_EN_PRICECUR": str(max_price or ""),
+            "CO_YN_RATE": "0", "CO_ST_RATE": "", "CO_EN_RATE": "",
+            "CO_YN_VALX": "0", "CO_ST_VALX": "", "CO_EN_VALX": "",
+            "CO_YN_SHAR": "0", "CO_ST_SHAR": "", "CO_EN_SHAR": "",
+            "CO_YN_VOLUME": "0", "CO_ST_VOLUME": "", "CO_EN_VOLUME": "",
+            "CO_YN_AMT": "0", "CO_ST_AMT": "", "CO_EN_AMT": "",
+            "CO_YN_EPS": "0", "CO_ST_EPS": "", "CO_EN_EPS": "",
+            "CO_YN_PER": "0", "CO_ST_PER": "", "CO_EN_PER": "",
+            "KEYB": "",
+        }
+        d = self._get("/uapi/overseas-price/v1/quotations/inquire-search", "HHDFS76410000", params)
+        out = []
+        for r in (d.get("output2") or [])[:count]:
+            sym = r.get("symb")
+            if not sym:
+                continue
+            out.append({
+                "code": sym,
+                "name": r.get("name") or r.get("knam") or sym,
+                "price": float(r.get("last", 0) or 0),
+                "change_rate": float(r.get("rate", 0) or 0),
+            })
+        return out
 
 
 # ===================================================================== #
@@ -588,6 +720,35 @@ def _vol_breakout_target(candles, k=0.5):
     return candles[-1]["open"] + (candles[-2]["high"] - candles[-2]["low"]) * k
 
 
+def _highest_high(candles, n):
+    """최근 n봉의 최고가(신고가 돌파 판정용)."""
+    if len(candles) < n or n <= 0:
+        return None
+    return max(c["high"] for c in candles[-n:])
+
+
+def _adx(candles, n=14):
+    """추세 강도(DX 기반 근사). 0~100, 높을수록 추세가 강함."""
+    if len(candles) < n + 1:
+        return None
+    plus_dm = minus_dm = tr_sum = 0.0
+    for i in range(-n, 0):
+        up = candles[i]["high"] - candles[i - 1]["high"]
+        dn = candles[i - 1]["low"] - candles[i]["low"]
+        plus_dm += up if (up > dn and up > 0) else 0.0
+        minus_dm += dn if (dn > up and dn > 0) else 0.0
+        h, l, pc = candles[i]["high"], candles[i]["low"], candles[i - 1]["close"]
+        tr_sum += max(h - l, abs(h - pc), abs(l - pc))
+    if tr_sum == 0:
+        return None
+    pdi = 100 * plus_dm / tr_sum
+    mdi = 100 * minus_dm / tr_sum
+    denom = pdi + mdi
+    if denom == 0:
+        return 0.0
+    return 100 * abs(pdi - mdi) / denom
+
+
 # ===================================================================== #
 #  종합 시그널 전략
 # ===================================================================== #
@@ -598,6 +759,8 @@ class Signal:
     score_sell: float
     reasons: list
     price: float
+    adx: float = 0.0          # 추세 강도(0~100)
+    trend_ok: bool = True     # 장기추세(레짐) 통과 여부
 
 
 class CompositeStrategy:
@@ -614,6 +777,8 @@ class CompositeStrategy:
         p = float(price if price else closes[-1])
         buy = sell = 0.0
         reasons = []
+        adx_val = _adx(candles, (self.ind.get("adx", {}) or {}).get("period", 14))
+        trend_ok = True
 
         c = self.ind.get("ma_cross", {})
         if c.get("enabled"):
@@ -663,13 +828,42 @@ class CompositeStrategy:
             if tgt and p >= tgt > 0:
                 buy += w; reasons.append(f"변동성돌파({tgt:.2f}) +{w}")
 
+        # N일 신고가 돌파 (레퍼런스: new_high_breakout)
+        c = self.ind.get("new_high", {})
+        if c.get("enabled"):
+            w = c.get("weight", 1)
+            period = c.get("period", 60)
+            hh = _highest_high(candles[:-1], period)
+            if hh and p >= hh:
+                buy += w; reasons.append(f"{period}일 신고가 돌파 +{w}")
+
+        # ADX 추세강도 확인: 추세가 약하면 매수 점수 차감(휩쏘 방지)
+        c = self.ind.get("adx", {})
+        if c.get("enabled"):
+            thr = c.get("min", 20)
+            if adx_val is not None and adx_val < thr:
+                buy = max(0.0, buy - c.get("penalty", 1))
+                reasons.append(f"추세약함(ADX {adx_val:.0f}<{thr})")
+
+        # 판정
         if buy >= self.buy_th and buy > sell:
             act = "buy"
         elif sell >= self.sell_th and sell > buy:
             act = "sell"
         else:
             act = "hold"
-        return Signal(act, buy, sell, reasons, p)
+
+        # 추세 필터(레짐): 장기 이평 아래면 신규 매수 보류 (하락장 매수 방지)
+        rc = self.ind.get("regime", {})
+        if rc.get("enabled"):
+            ma_p = rc.get("ma", 60)
+            lma = _sma(closes, ma_p) if len(closes) >= ma_p else None
+            if lma is not None and p < lma:
+                trend_ok = False
+                if act == "buy":
+                    act = "hold"
+                    reasons.append(f"추세필터: 가격<{ma_p}일선 매수보류")
+        return Signal(act, buy, sell, reasons, p, adx_val or 0.0, trend_ok)
 
 
 # ===================================================================== #
@@ -694,16 +888,25 @@ class RiskManager:
         if stop <= 0:
             return 0
         q = int(risk_amt / stop)
-        if q < 1:
-            q = 1 if price <= risk_amt else 0
-        return q
+        if q < 1 and price <= risk_amt:
+            q = 1
+        # 보유금액(예수금)으로 살 수 있는 최대 수량으로 제한 (수수료 0.5% 버퍼)
+        affordable = int(cash // (price * 1.005))
+        q = min(q, affordable)
+        return q if q >= 1 else 0
 
-    def should_exit(self, avg, cur):
+    def should_exit(self, avg, cur, peak=None):
         if avg <= 0:
             return ""
         pct = (cur - avg) / avg * 100
         if pct <= -self.cfg.get("stop_loss_pct", 5.0):
             return "손절"
+        # 트레일링 스탑: 보유 고점 대비 하락폭이 기준 초과 + 수익 구간일 때
+        ts = self.cfg.get("trailing_stop_pct", 0)
+        if ts and peak and peak > 0:
+            draw = (cur - peak) / peak * 100
+            if draw <= -ts and cur > avg:
+                return "트레일링스탑"
         if pct >= self.cfg.get("take_profit_pct", 10.0):
             return "익절"
         return ""
@@ -778,6 +981,15 @@ class TradeJournal:
         except Exception:  # noqa
             return []
 
+    def clear_failed(self):
+        """체결 실패(ok=0)한 기록만 삭제. 실제 매수/매도 성공 기록은 보존."""
+        try:
+            with self.lock, self._conn() as c:
+                cur = c.execute("DELETE FROM trades WHERE ok=0")
+                return cur.rowcount
+        except Exception:  # noqa
+            return 0
+
     def summary(self, start_date, end_date):
         """기간(YYYY-MM-DD) 집계."""
         try:
@@ -843,6 +1055,16 @@ class Trader:
         self._thread = None
         self._scan_lock = threading.Lock()   # 동시 스캔 방지(유량 절약)
         self.last_signals = {}
+        self._peak = {}        # 보유 고점(트레일링 스탑용)
+        self._cooldown = {}    # 청산 후 재매수 쿨다운 타임스탬프
+        self.last_candidates = []  # 최근 스크리너 후보
+
+    def _in_cooldown(self, code):
+        mins = self.s.risk.get("cooldown_min", 0)
+        if not mins:
+            return False
+        ts = self._cooldown.get(code)
+        return ts is not None and (time.time() - ts) < mins * 60
 
     def _dom(self):
         return self.s.universe.get("domestic", []) or []
@@ -871,54 +1093,162 @@ class Trader:
         try:
             candles = self.api.domestic_daily(code)
             q = self.api.domestic_price(code)
-            sig = self.strategy.evaluate(candles, q["price"])
+            price = q["price"]
+            sig = self.strategy.evaluate(candles, price)
             self.last_signals[code] = sig
             pos = next((p for p in bal["positions"] if p["code"] == code), None)
             if pos:
-                why = self.risk.should_exit(pos["avg_price"], q["price"])
+                # 보유 고점 갱신(트레일링 스탑)
+                peak = max(self._peak.get(code, pos["avg_price"]), price)
+                self._peak[code] = peak
+                why = self.risk.should_exit(pos["avg_price"], price, peak)
                 if why or sig.action == "sell":
                     why = why or "전략매도"
                     if self.auto_enabled:
                         r = self.api.domestic_order(code, pos["qty"], "sell")
-                        pnl = (q["price"] - pos["avg_price"]) * pos["qty"]
+                        pnl = (price - pos["avg_price"]) * pos["qty"]
                         self._report("매도", "domestic", code, pos.get("name", code),
-                                     "sell", pos["qty"], q["price"], why, r, pnl=pnl)
+                                     "sell", pos["qty"], price, why, r, pnl=pnl)
+                        self._cooldown[code] = time.time()   # 청산 후 쿨다운 시작
+                        self._peak.pop(code, None)
                     else:
                         self.notify(f"📉[신호] {code} 매도추천({why}) — 자동OFF")
                     return
             if sig.action == "buy" and not pos:
+                if self._in_cooldown(code):
+                    return
                 if not self.risk.can_open(len(bal["positions"])):
                     return
-                qty = self.risk.position_size(bal.get("cash", 0), q["price"], candles)
+                qty = self.risk.position_size(bal.get("cash", 0), price, candles)
                 if qty < 1:
                     return
                 if self.auto_enabled:
                     r = self.api.domestic_order(code, qty, "buy")
                     self._report("매수", "domestic", code, code, "buy", qty,
-                                 q["price"], ", ".join(sig.reasons), r)
+                                 price, ", ".join(sig.reasons), r)
+                    self._peak[code] = price
                 else:
                     self.notify(f"📈[신호] {code} 매수추천 {qty}주({', '.join(sig.reasons)}) — 자동OFF")
         except Exception as e:  # noqa
             log.exception("국내 처리오류 %s", code)
             self.notify(f"⚠️ {code} 오류: {e}")
 
-    def _proc_ovs(self, item, bal):
+    def _proc_ovs(self, item, obal):
         sym, exch = item.get("symbol"), item.get("exchange", "NAS")
         try:
             candles = self.api.overseas_daily(sym, exch)
             q = self.api.overseas_price(sym, exch)
-            sig = self.strategy.evaluate(candles, q["price"])
+            price = q["price"]
+            sig = self.strategy.evaluate(candles, price)
             self.last_signals[sym] = sig
-            if sig.action == "buy":
+            pos = next((p for p in obal["positions"] if p["code"] == sym), None)
+            if pos:
+                peak = max(self._peak.get(sym, pos["avg_price"]), price)
+                self._peak[sym] = peak
+                why = self.risk.should_exit(pos["avg_price"], price, peak)
+                if why or sig.action == "sell":
+                    why = why or "전략매도"
+                    if self.auto_enabled:
+                        r = self.api.overseas_order(sym, pos["qty"], "sell", price, exch)
+                        pnl = (price - pos["avg_price"]) * pos["qty"]
+                        self._report("매도(美)", "overseas", sym, sym, "sell",
+                                     pos["qty"], price, why, r, pnl=pnl)
+                        self._cooldown[sym] = time.time()
+                        self._peak.pop(sym, None)
+                    else:
+                        self.notify(f"📉[신호] {sym} 매도추천({why}) — 자동OFF")
+                    return
+            if sig.action == "buy" and not pos:
+                if self._in_cooldown(sym):
+                    return
+                if not self.risk.can_open(len(obal["positions"])):
+                    return
+                # 매수가능금액 산정: 통합증거금이면 원화로도 가능(매수가능금액 조회 우선)
+                cash = obal.get("cash", 0)   # USD 예수금
+                maxqty = None
+                if (self.s.screener or {}).get("overseas_use_buyable", True):
+                    try:
+                        b = self.api.overseas_buyable(sym, price, exch)
+                        if b["amount"] > 0:
+                            cash = b["amount"]      # 통합증거금/환율 반영 주문가능 USD
+                        if b["qty"] > 0:
+                            maxqty = b["qty"]
+                    except Exception as e:  # noqa
+                        log.warning("%s 매수가능금액 조회 실패, 예수금 기준: %s", sym, e)
+                if cash <= 0 and not maxqty:
+                    log.info("%s 매수가능금액 0/미확인 — 건너뜀", sym)
+                    return
+                qty = self.risk.position_size(cash, price, candles) if cash > 0 else (maxqty or 0)
+                if maxqty is not None:
+                    qty = min(qty, maxqty)
+                if qty < 1:
+                    log.info("%s 매수가능 수량 부족(1주 미만) — 건너뜀", sym)
+                    return
                 if self.auto_enabled:
-                    r = self.api.overseas_order(sym, 1, "buy", q["price"], exch)
-                    self._report("매수(美)", "overseas", sym, sym, "buy", 1,
-                                 q["price"], ", ".join(sig.reasons), r)
+                    r = self.api.overseas_order(sym, qty, "buy", price, exch)
+                    self._report("매수(美)", "overseas", sym, sym, "buy", qty,
+                                 price, ", ".join(sig.reasons), r)
+                    self._peak[sym] = price
                 else:
-                    self.notify(f"📈[신호] {sym} 매수추천({', '.join(sig.reasons)}) — 자동OFF")
+                    self.notify(f"📈[신호] {sym} 매수추천 {qty}주({', '.join(sig.reasons)}) — 자동OFF")
         except Exception as e:  # noqa
             log.exception("해외 처리오류 %s", sym)
             self.notify(f"⚠️ {sym} 오류: {e}")
+
+    def screen_candidates(self, cash=0):
+        """스크리너가 켜져 있으면 시장 전체에서 후보 발굴, 아니면 고정 universe.
+        cash>0 면 보유현금으로 최소 1주 살 수 있는 종목만 남긴다."""
+        sc = self.s.screener or {}
+        if not sc.get("enabled"):
+            return [{"code": c, "name": c} for c in self._dom()]
+        try:
+            pool = self.api.domestic_volume_rank(sc.get("market", "all"), sc.get("pool_size", 30))
+        except Exception as e:  # noqa
+            log.warning("스크리너 조회 실패, 고정 universe 사용: %s", e)
+            return [{"code": c, "name": c} for c in self._dom()]
+        lo = sc.get("min_price", 0)
+        hi = sc.get("max_price", 10 ** 12)
+        pool = [x for x in pool if lo <= x["price"] <= hi]
+        if cash and cash > 0:   # 보유현금으로 1주 이상 가능한 종목만(수수료 0.5% 버퍼)
+            pool = [x for x in pool if x["price"] > 0 and x["price"] * 1.005 <= cash]
+        if sc.get("momentum_rank", True):
+            pool.sort(key=lambda x: x["change_rate"], reverse=True)
+        top = pool[: sc.get("top_k", 15)]
+        self.last_candidates = top
+        return top
+
+    def screen_overseas(self, cash=0):
+        """미국장 후보 발굴(USD 기준). 조건검색 실패시 후보풀 사용.
+        cash>0(USD) 면 그 금액으로 1주 살 수 있는 종목만 남긴다."""
+        sc = self.s.screener or {}
+        exch = sc.get("overseas_market", "NAS")
+        if not sc.get("enabled"):
+            return self._ovs()
+        lo = sc.get("overseas_min_price", 0)
+        hi = sc.get("overseas_max_price", 10 ** 9)
+        topk = sc.get("top_k", 15)
+        pool = []
+        try:
+            pool = self.api.overseas_search(exch, lo, hi, sc.get("pool_size", 30))
+        except Exception as e:  # noqa
+            log.warning("미국 스크리너 실패, 후보풀 사용: %s", e)
+        if not pool:
+            return [{"symbol": s, "exchange": exch} for s in sc.get("overseas_pool", [])[:topk]]
+        pool = [x for x in pool if lo <= x["price"] <= hi]
+        if cash and cash > 0:   # USD 예수금으로 1주 이상 가능한 종목만
+            pool = [x for x in pool if x["price"] > 0 and x["price"] * 1.005 <= cash]
+        if sc.get("momentum_rank", True):
+            pool.sort(key=lambda x: x["change_rate"], reverse=True)
+        self.last_candidates = pool[:topk]
+        return [{"symbol": x["code"], "exchange": exch} for x in pool[:topk]]
+
+    def safe_overseas_balance(self):
+        exch = (self.s.screener or {}).get("overseas_market", "NAS")
+        try:
+            return self.api.overseas_balance(exch)
+        except Exception as e:  # noqa
+            log.warning("미국 잔고조회 실패: %s", e)
+            return {"cash": 0, "positions": []}
 
     def scan_once(self):
         # 이미 다른 스캔이 진행 중이면 건너뜀(유량 초과 방지)
@@ -926,16 +1256,40 @@ class Trader:
             log.info("스캔 이미 진행 중 — 이번 호출은 건너뜁니다.")
             return
         try:
+            self.last_signals = {}   # 현재 스캔 결과만 표시
             bal = self.safe_balance()
             eq = bal.get("total_eval") or bal.get("cash", 0)
             lim = self.risk.check_limits(eq)
             if lim:
                 self.notify(f"🛑 {lim} 도달 — 매매 중단. 필요시 전체청산하세요.")
                 return
-            for code in self._dom():
-                self._proc_dom(code, bal)
-            for it in self._ovs():
-                self._proc_ovs(it, bal)
+            dom_open = self._dom_open()
+            ovs_open = self._ovs_open()
+
+            # 국내장: 열려 있거나, 둘 다 닫혀 있으면 기본 분석용으로 국내 스캔
+            if dom_open or not ovs_open:
+                codes = [c["code"] for c in self.screen_candidates(bal.get("cash", 0))]
+                for p in bal["positions"]:
+                    if p["code"] not in codes:
+                        codes.append(p["code"])
+                for code in codes:
+                    self._proc_dom(code, bal)
+
+            # 미국장: 열려 있으면 미국 종목 발굴(USD 기준)
+            if ovs_open:
+                obal = self.safe_overseas_balance()
+                # 통합증거금이면 USD예수금이 0이어도 원화로 매수 가능 → 화면필터는 끄고
+                # 주문 단계의 매수가능금액 조회로 정확히 판단
+                us_cash = 0 if (self.s.screener or {}).get("overseas_use_buyable", True) \
+                    else obal.get("cash", 0)
+                items = self.screen_overseas(us_cash)
+                cand = [it["symbol"] for it in items]
+                for p in obal["positions"]:   # 미국 보유종목은 청산 관리 위해 포함
+                    if p["code"] not in cand:
+                        items.append({"symbol": p["code"],
+                                      "exchange": (self.s.screener or {}).get("overseas_market", "NAS")})
+                for it in items:
+                    self._proc_ovs(it, obal)
         finally:
             self._scan_lock.release()
 
@@ -952,17 +1306,23 @@ class Trader:
         self.running = False
         self._stop.set()
 
-    def _in_session(self):
+    @staticmethod
+    def _within(rng):
         now = datetime.now().strftime("%H:%M")
+        try:
+            a, b = rng.split("-")
+            return (a <= now <= b) if a <= b else (now >= a or now <= b)
+        except Exception:  # noqa
+            return True
 
-        def within(rng):
-            try:
-                a, b = rng.split("-")
-                return (a <= now <= b) if a <= b else (now >= a or now <= b)
-            except Exception:  # noqa
-                return True
-        return within(self.s.engine.get("domestic_session", "09:00-15:20")) or \
-            within(self.s.engine.get("overseas_session", "23:30-06:00"))
+    def _dom_open(self):
+        return self._within(self.s.engine.get("domestic_session", "09:00-15:20"))
+
+    def _ovs_open(self):
+        return self._within(self.s.engine.get("overseas_session", "23:30-06:00"))
+
+    def _in_session(self):
+        return self._dom_open() or self._ovs_open()
 
     def _loop(self):
         iv = self.s.engine.get("loop_interval_sec", 60)
@@ -1008,14 +1368,25 @@ class Trader:
         return r
 
     def liquidate_all(self):
-        bal = self.safe_balance()
         res = []
-        for p in bal["positions"]:
+        # 국내 전체 청산
+        for p in self.safe_balance()["positions"]:
             r = self.api.domestic_order(p["code"], p["qty"], "sell")
             pnl = (p["cur_price"] - p["avg_price"]) * p["qty"]
             self.journal.log(self.s.mode, "domestic", p["code"], p.get("name", p["code"]),
                              "sell", p["qty"], p["cur_price"], "전체청산", pnl,
                              r.get("ok"), r.get("msg", ""))
+            self._peak.pop(p["code"], None)
+            res.append((p["code"], r.get("ok")))
+        # 미국 전체 청산
+        exch = (self.s.screener or {}).get("overseas_market", "NAS")
+        for p in self.safe_overseas_balance()["positions"]:
+            r = self.api.overseas_order(p["code"], p["qty"], "sell", p.get("cur_price", 0) or 0, exch)
+            pnl = (p["cur_price"] - p["avg_price"]) * p["qty"]
+            self.journal.log(self.s.mode, "overseas", p["code"], p.get("name", p["code"]),
+                             "sell", p["qty"], p["cur_price"], "전체청산", pnl,
+                             r.get("ok"), r.get("msg", ""))
+            self._peak.pop(p["code"], None)
             res.append((p["code"], r.get("ok")))
         return res
 
@@ -1373,10 +1744,12 @@ class TradingApp:
         self.nb.add(f, text="📒 매매일지")
         head = tk.Frame(f, bg=BG)
         head.pack(fill="x", pady=(12, 2), padx=8)
-        tk.Label(head, text="매매일지 (전체 주문 기록)", bg=BG, fg=FG,
+        tk.Label(head, text="매매일지 (체결 성공만 주간리포트 반영)", bg=BG, fg=FG,
                  font=(FONT, 11, "bold")).pack(side="left")
         tk.Button(head, text="↻ 새로고침", command=self.refresh_journal, bg=CARD, fg=FG,
                   relief="flat", cursor="hand2", padx=10, pady=3, bd=0).pack(side="right")
+        tk.Button(head, text="🗑 실패기록 정리", command=self.clear_failed_journal, bg=CARD, fg=YELLOW,
+                  relief="flat", cursor="hand2", padx=10, pady=3, bd=0).pack(side="right", padx=4)
         cols = ("시각", "시장", "종목", "구분", "수량", "가격", "금액", "실현손익", "사유", "결과")
         widths = (135, 60, 90, 50, 55, 90, 110, 110, 130, 55)
         self.jtree = ttk.Treeview(f, columns=cols, show="headings", height=18)
@@ -1417,13 +1790,20 @@ class TradingApp:
     def _tab_sig(self):
         f = tk.Frame(self.nb, bg=BG)
         self.nb.add(f, text="📡 시그널")
-        tk.Button(f, text="↻ 스캔", command=self.scan_now, bg=PANEL, fg=FG,
-                  relief="flat", cursor="hand2").pack(anchor="e", padx=8, pady=6)
-        cols = ("종목", "판정", "매수점수", "매도점수", "가격")
-        self.sig_tree = ttk.Treeview(f, columns=cols, show="headings", height=15)
-        for c in cols:
+        head = tk.Frame(f, bg=BG)
+        head.pack(fill="x", padx=8, pady=6)
+        tk.Label(head, text="스크리너 발굴 종목 · 시그널", bg=BG, fg=FG,
+                 font=(FONT, 11, "bold")).pack(side="left")
+        tk.Button(head, text="↻ 스캔", command=self.scan_now, bg=CARD, fg=FG,
+                  relief="flat", cursor="hand2", padx=10, pady=3, bd=0).pack(side="right")
+        cols = ("종목", "판정", "매수점수", "매도점수", "ADX", "추세", "가격")
+        widths = (110, 80, 80, 80, 70, 70, 110)
+        self.sig_tree = ttk.Treeview(f, columns=cols, show="headings", height=16)
+        for c, w in zip(cols, widths):
             self.sig_tree.heading(c, text=c)
-            self.sig_tree.column(c, anchor="center", width=130)
+            self.sig_tree.column(c, anchor="center", width=w)
+        self.sig_tree.tag_configure("buy", foreground=GREEN)
+        self.sig_tree.tag_configure("sell", foreground=RED)
         self.sig_tree.pack(fill="both", expand=True, padx=8, pady=8)
 
     def _tab_manual(self):
@@ -1574,6 +1954,18 @@ class TradingApp:
     def refresh_journal(self):
         threading.Thread(target=lambda: self.q.put(("journal", self.journal.recent(300))),
                          daemon=True).start()
+
+    def clear_failed_journal(self):
+        if not messagebox.askyesno("실패기록 정리",
+                                   "체결되지 않은(실패) 기록만 삭제합니다.\n실제 매수/매도 성공 기록은 보존됩니다. 진행할까요?"):
+            return
+
+        def work():
+            n = self.journal.clear_failed()
+            self.q.put(("log", f"실패/미체결 기록 {n}건 정리"))
+            self.refresh_journal()
+            self.show_report("daily")
+        threading.Thread(target=work, daemon=True).start()
 
     def show_report(self, period):
         def work():
@@ -1828,10 +2220,17 @@ class TradingApp:
     def _render_sig(self, sigs):
         for i in self.sig_tree.get_children():
             self.sig_tree.delete(i)
-        for code, s in sigs.items():
+        # 매수>보유>매도 순으로 보기 좋게 정렬
+        order = {"buy": 0, "sell": 1, "hold": 2}
+        rows = sorted(sigs.items(), key=lambda kv: (order.get(kv[1].action, 3), -kv[1].score_buy))
+        for code, s in rows:
             e = {"buy": "📈매수", "sell": "📉매도", "hold": "⏸보유"}.get(s.action, s.action)
-            self.sig_tree.insert("", "end", values=(code, e, f"{s.score_buy:.0f}",
-                                 f"{s.score_sell:.0f}", f"{s.price:,.2f}"))
+            adx = getattr(s, "adx", 0) or 0
+            trend = "▲상승" if getattr(s, "trend_ok", True) else "▼하락"
+            tag = s.action if s.action in ("buy", "sell") else ""
+            self.sig_tree.insert("", "end", tags=(tag,), values=(
+                code, e, f"{s.score_buy:.0f}", f"{s.score_sell:.0f}",
+                f"{adx:.0f}", trend, f"{s.price:,.2f}"))
 
     def _refresh(self):
         s = self.settings

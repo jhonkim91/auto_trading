@@ -15,6 +15,26 @@ universe:
     - { symbol: "AAPL", exchange: "NAS" }
     - { symbol: "TSLA", exchange: "NAS" }
 
+# 시장 전체 스크리너 (종목 자동 발굴)
+# enabled: true 면 위 universe.domestic 고정목록 대신 거래량순위에서 후보를 뽑아
+# 가격/모멘텀 필터 후 상위 top_k 종목만 전략 분석해 자동매매한다.
+screener:
+  enabled: true
+  market: "all"        # all / kospi / kosdaq
+  pool_size: 30        # 거래량 순위 후보 수
+  top_k: 15            # 심층 분석(자동매매 대상) 상위 모멘텀 종목 수
+  min_price: 2000      # 국내 동전주 제외(원)
+  max_price: 500000    # 국내(원)
+  momentum_rank: true  # 등락률 기준 모멘텀 정렬
+  # 미국장(USD 기준) - 미국장 시간엔 미국 종목을 발굴
+  overseas_market: "NAS"     # NAS / NYS / AMS
+  overseas_min_price: 5      # USD
+  overseas_max_price: 1000   # USD
+  overseas_pool: ["AAPL","MSFT","NVDA","TSLA","AMZN","GOOGL","META","AMD","NFLX","AVGO","PLTR","COIN"]
+  # true: 통합증거금(원화로 미국매수·자동환전) 기준 매수가능금액으로 수량 산정
+  # false: USD 예수금만 사용(미리 환전한 달러로만 매수)
+  overseas_use_buyable: true
+
 # 매매 엔진
 engine:
   loop_interval_sec: 60          # 시그널 점검 주기(초)
@@ -25,14 +45,18 @@ engine:
 # 종합 시그널 전략 가중치 (점수 합산 방식)
 # 각 지표가 매수/매도 점수를 내고, 임계치를 넘으면 주문
 strategy:
-  buy_threshold: 2               # 매수 점수 합이 이 값 이상이면 매수
-  sell_threshold: 2              # 매도 점수 합이 이 값 이상이면 매도
+  # 지표 최대 가중치 합: 매수 7(이평1+RSI1+MACD1+볼린저1+돌파2+신고가1), 매도 4
+  buy_threshold: 3               # 매수: 변동성돌파(2) 단독 불가 → 2개 이상 지표 동의 필요
+  sell_threshold: 2              # 매도: 빠른 청산 위해 2 유지 (손절/트레일링/익절은 별도)
   indicators:
     ma_cross:    { enabled: true,  short: 5,  long: 20,  weight: 1 }
     rsi:         { enabled: true,  period: 14, low: 30, high: 70, weight: 1 }
     macd:        { enabled: true,  fast: 12, slow: 26, signal: 9, weight: 1 }
     bollinger:   { enabled: true,  period: 20, num_std: 2.0, weight: 1 }
     vol_breakout: { enabled: true, k: 0.5, weight: 2 }   # 래리 윌리엄스 변동성 돌파
+    new_high:    { enabled: true,  period: 60, weight: 1 }              # N일 신고가 돌파
+    adx:         { enabled: true,  period: 14, min: 20, penalty: 1 }    # 추세 강도 약하면 매수점수 차감
+    regime:      { enabled: true,  ma: 60 }                             # 가격이 60일선 아래면 신규매수 보류(하락장 방지)
 
 # 리스크 관리
 risk:
@@ -40,6 +64,8 @@ risk:
   risk_per_trade_pct: 1.0        # 거래당 계좌대비 위험 비율(%) - ATR 기반 포지션 사이징
   stop_loss_pct: 5.0             # 손절 라인(%)
   take_profit_pct: 10.0          # 익절 라인(%)
+  trailing_stop_pct: 4.0         # 트레일링 스탑(%): 보유 고점 대비 하락폭, 수익구간에서만 작동 (0이면 끔)
+  cooldown_min: 30               # 청산 후 같은 종목 재매수 금지 시간(분), 0이면 끔
   daily_loss_limit_pct: 3.0      # 일일 손실 한도(%) 도달 시 당일 매매 중단
   max_drawdown_pct: 15.0         # 누적 MDD 한도(%) 도달 시 전체 청산 알림
   atr_period: 14
