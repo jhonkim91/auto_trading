@@ -15,6 +15,70 @@ from .logger import get_logger
 log = get_logger("trader")
 
 
+def _to_float(value) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _normalize_position(position: dict, market: str, currency: str) -> dict:
+    item = dict(position or {})
+    item["market"] = market
+    item["market_label"] = "국내" if market == "domestic" else "미국"
+    item["currency"] = currency
+    item["position_value"] = _to_float(item.get("cur_price")) * _to_float(item.get("qty"))
+    return item
+
+
+def build_portfolio_snapshot(domestic: dict, overseas: dict) -> dict:
+    """국내 원화 잔고와 미국 달러 잔고를 통화별로 분리해 표시용 스냅샷으로 합친다."""
+    domestic = domestic or {}
+    overseas = overseas or {}
+    domestic_positions = [
+        _normalize_position(p, "domestic", "KRW")
+        for p in domestic.get("positions", [])
+    ]
+    overseas_positions = [
+        _normalize_position(p, "overseas", "USD")
+        for p in overseas.get("positions", [])
+    ]
+    cash_krw = _to_float(domestic.get("cash"))
+    total_eval_krw = _to_float(domestic.get("total_eval"))
+    cash_usd = _to_float(overseas.get("cash"))
+    overseas_value = sum(_to_float(p.get("position_value")) for p in overseas_positions)
+    total_eval_usd = _to_float(overseas.get("total_eval"))
+    if not total_eval_usd and (cash_usd or overseas_value):
+        total_eval_usd = cash_usd + overseas_value
+    return {
+        "cash": cash_krw,
+        "cash_krw": cash_krw,
+        "cash_usd": cash_usd,
+        "total_eval": total_eval_krw,
+        "total_eval_krw": total_eval_krw,
+        "total_eval_usd": total_eval_usd,
+        "pnl_krw": sum(_to_float(p.get("pnl_amt")) for p in domestic_positions),
+        "pnl_usd": sum(_to_float(p.get("pnl_amt")) for p in overseas_positions),
+        "positions": domestic_positions + overseas_positions,
+        "domestic": domestic,
+        "overseas": overseas,
+    }
+
+
+def _format_money(value, currency: str = "KRW", signed: bool = False) -> str:
+    value = _to_float(value)
+    if currency == "USD":
+        return f"{value:+,.2f} USD" if signed else f"{value:,.2f} USD"
+    return f"{value:+,.0f}원" if signed else f"{value:,.0f}원"
+
+
+def _format_balance_lines(krw_value, usd_value=0, include_usd: bool = False, signed: bool = False) -> str:
+    lines = [_format_money(krw_value, "KRW", signed=signed)]
+    if include_usd or _to_float(usd_value):
+        lines.append(_format_money(usd_value, "USD", signed=signed))
+    return "\n".join(lines)
+
+
 class Trader:
     def __init__(self, settings, notify=None):
         self.s = settings
@@ -155,6 +219,19 @@ class Trader:
             log.warning("잔고조회 실패: %s", e)
             return {"cash": 0, "total_eval": 0, "positions": []}
 
+    def safe_overseas_balance(self):
+        items = self._overseas_items()
+        exchange = items[0].get("exchange", "NAS") if items else "NAS"
+        try:
+            return self.api.overseas_balance(exchange)
+        except Exception as e:  # noqa
+            log.warning("미국 잔고조회 실패: %s", e)
+            return {"cash": 0, "total_eval": 0, "positions": []}
+
+    def portfolio_balance(self):
+        """대시보드/리포트 표시용 국내+미국 잔고 스냅샷을 반환한다."""
+        return build_portfolio_snapshot(self.safe_domestic_balance(), self.safe_overseas_balance())
+
     # ----------------------------------------------------------------- #
     #  자동매매 루프 (별도 스레드)
     # ----------------------------------------------------------------- #
@@ -224,16 +301,24 @@ class Trader:
         return results
 
     def portfolio_report(self) -> str:
-        bal = self.safe_domestic_balance()
-        lines = [f"💼 포트폴리오 ({self.s.mode})",
-                 f"예수금: {bal['cash']:,.0f}원",
-                 f"총평가: {bal['total_eval']:,.0f}원"]
+        bal = self.portfolio_balance()
+        has_usd = bool(bal.get("overseas", {}).get("positions")) or bool(bal.get("cash_usd"))
+        lines = [
+            f"💼 포트폴리오 ({self.s.mode})",
+            "예수금: " + _format_balance_lines(bal.get("cash_krw"), bal.get("cash_usd"), has_usd),
+            "총평가: " + _format_balance_lines(
+                bal.get("total_eval_krw"), bal.get("total_eval_usd"), has_usd
+            ),
+        ]
         if not bal["positions"]:
             lines.append("보유 종목 없음")
         for p in bal["positions"]:
+            currency = p.get("currency", "KRW")
             lines.append(
-                f"• {p['name']}({p['code']}) {p['qty']}주 "
-                f"평단 {p['avg_price']:,.0f} 현재 {p['cur_price']:,.0f} "
+                f"• [{p.get('market_label', '-')}] {p['name']}({p['code']}) {p['qty']}주 "
+                f"평단 {_format_money(p['avg_price'], currency)} "
+                f"현재 {_format_money(p['cur_price'], currency)} "
+                f"손익 {_format_money(p.get('pnl_amt', 0), currency, signed=True)} "
                 f"({p['pnl_rate']:+.2f}%)"
             )
         return "\n".join(lines)

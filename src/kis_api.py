@@ -23,6 +23,21 @@ _TOKEN_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), "token.da
 _TOKEN_REFRESH_SEC = 6 * 3600  # 6시간마다 갱신 권장
 
 
+def _to_float(value) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _first_float(data: dict, keys: tuple) -> float:
+    for key in keys:
+        value = _to_float((data or {}).get(key))
+        if value:
+            return value
+    return 0.0
+
+
 class RateLimiter:
     """슬라이딩 윈도우 초당 호출 제한."""
 
@@ -269,6 +284,8 @@ class KISApi:
                     "cur_price": float(r.get("prpr", 0) or 0),
                     "pnl_rate": float(r.get("evlu_pfls_rt", 0) or 0),
                     "pnl_amt": float(r.get("evlu_pfls_amt", 0) or 0),
+                    "market": "domestic",
+                    "currency": "KRW",
                 }
             )
         summary = (data.get("output2") or [{}])[0]
@@ -380,6 +397,21 @@ class KISApi:
                     "cur_price": float(r.get("now_pric2", 0) or 0),
                     "pnl_rate": float(r.get("evlu_pfls_rt", 0) or 0),
                     "pnl_amt": float(r.get("frcr_evlu_pfls_amt", 0) or 0),
+                    "market": "overseas",
+                    "currency": "USD",
                 }
             )
-        return {"positions": positions, "raw": data.get("output2")}
+        summary = data.get("output2") or {}
+        if isinstance(summary, list):
+            summary = summary[0] if summary else {}
+        cash = _first_float(
+            summary,
+            ("frcr_dncl_amt_2", "frcr_dncl_amt1", "frcr_buy_psbl_amt1"),
+        )
+        total_eval = _first_float(
+            summary,
+            ("tot_evlu_amt", "ovrs_tot_evlu_amt", "frcr_evlu_tota", "frcr_evlu_amt2"),
+        )
+        if not total_eval and (cash or positions):
+            total_eval = cash + sum(_to_float(p.get("cur_price")) * _to_float(p.get("qty")) for p in positions)
+        return {"cash": cash, "total_eval": total_eval, "positions": positions, "raw": summary}

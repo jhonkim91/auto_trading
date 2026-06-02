@@ -24,6 +24,7 @@ import threading
 import urllib.request
 import urllib.parse
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
@@ -163,6 +164,8 @@ class Settings:
     engine: dict = field(default_factory=dict)
     universe: dict = field(default_factory=dict)
     screener: dict = field(default_factory=dict)
+    paper_account: str = ""
+    real_account: str = ""
 
     @property
     def is_paper(self):
@@ -171,6 +174,10 @@ class Settings:
     @property
     def base_url(self):
         return PAPER_BASE_URL if self.is_paper else REAL_BASE_URL
+
+    @property
+    def active_account_key(self):
+        return "KIS_PAPER_ACCOUNT" if self.is_paper else "KIS_REAL_ACCOUNT"
 
 
 def _read_env_file():
@@ -209,11 +216,13 @@ def load_settings():
         return os.getenv(key, env.get(key, default))
 
     mode = (g("TRADING_MODE", "paper") or "paper").lower()
+    paper_account = g("KIS_PAPER_ACCOUNT")
+    real_account = g("KIS_REAL_ACCOUNT")
     if mode == "real":
-        ak, sk, acc = g("KIS_REAL_APP_KEY"), g("KIS_REAL_APP_SECRET"), g("KIS_REAL_ACCOUNT")
+        ak, sk, acc = g("KIS_REAL_APP_KEY"), g("KIS_REAL_APP_SECRET"), real_account
     else:
         mode = "paper"
-        ak, sk, acc = g("KIS_PAPER_APP_KEY"), g("KIS_PAPER_APP_SECRET"), g("KIS_PAPER_ACCOUNT")
+        ak, sk, acc = g("KIS_PAPER_APP_KEY"), g("KIS_PAPER_APP_SECRET"), paper_account
     no, prod = _split_account(acc)
     chat_raw = g("TELEGRAM_ALLOWED_CHAT_IDS", "")
     allowed = [c.strip() for c in chat_raw.split(",") if c.strip()]
@@ -230,7 +239,7 @@ def load_settings():
     return Settings(mode, ak, sk, no, prod, g("TELEGRAM_BOT_TOKEN"), allowed,
                     cfg.get("strategy", {}), cfg.get("risk", {}),
                     cfg.get("engine", {}), cfg.get("universe", {}),
-                    cfg.get("screener", {}))
+                    cfg.get("screener", {}), paper_account, real_account)
 
 
 def update_env(updates):
@@ -267,6 +276,84 @@ def validate(s):
     if not s.allowed_chat_ids or not all(c.isdigit() for c in s.allowed_chat_ids):
         miss.append("TELEGRAM_ALLOWED_CHAT_IDS(숫자)")
     return miss
+
+
+def _to_float(value):
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _first_float(data, keys):
+    for key in keys:
+        value = _to_float((data or {}).get(key))
+        if value:
+            return value
+    return 0.0
+
+
+def _normalize_position(position, market, currency):
+    item = dict(position or {})
+    item["market"] = market
+    item["market_label"] = "국내" if market == "domestic" else "미국"
+    item["currency"] = currency
+    item["position_value"] = _to_float(item.get("cur_price")) * _to_float(item.get("qty"))
+    return item
+
+
+def build_portfolio_snapshot(domestic, overseas):
+    """국내 원화 잔고와 미국 달러 잔고를 통화별로 분리한 표시용 스냅샷으로 합친다."""
+    domestic = domestic or {}
+    overseas = overseas or {}
+    domestic_positions = [
+        _normalize_position(p, "domestic", "KRW")
+        for p in domestic.get("positions", [])
+    ]
+    overseas_positions = [
+        _normalize_position(p, "overseas", "USD")
+        for p in overseas.get("positions", [])
+    ]
+    cash_krw = _to_float(domestic.get("cash"))
+    total_eval_krw = _to_float(domestic.get("total_eval"))
+    cash_usd = _to_float(overseas.get("cash"))
+    overseas_value = sum(_to_float(p.get("position_value")) for p in overseas_positions)
+    total_eval_usd = _to_float(overseas.get("total_eval"))
+    if not total_eval_usd and (cash_usd or overseas_value):
+        total_eval_usd = cash_usd + overseas_value
+    pnl_krw = sum(_to_float(p.get("pnl_amt")) for p in domestic_positions)
+    pnl_usd = sum(_to_float(p.get("pnl_amt")) for p in overseas_positions)
+    return {
+        "cash": cash_krw,
+        "cash_krw": cash_krw,
+        "cash_usd": cash_usd,
+        "total_eval": total_eval_krw,
+        "total_eval_krw": total_eval_krw,
+        "total_eval_usd": total_eval_usd,
+        "pnl_krw": pnl_krw,
+        "pnl_usd": pnl_usd,
+        "positions": domestic_positions + overseas_positions,
+        "domestic": domestic,
+        "overseas": overseas,
+    }
+
+
+def _format_money(value, currency="KRW", signed=False):
+    value = _to_float(value)
+    if currency == "USD":
+        return f"{value:+,.2f} USD" if signed else f"{value:,.2f} USD"
+    return f"{value:+,.0f}원" if signed else f"{value:,.0f}원"
+
+
+def _format_balance_lines(krw_value, usd_value=0, include_usd=False, signed=False):
+    lines = [_format_money(krw_value, "KRW", signed=signed)]
+    if include_usd or _to_float(usd_value):
+        lines.append(_format_money(usd_value, "USD", signed=signed))
+    return "\n".join(lines)
+
+
+def mode_label(mode):
+    return "실전" if mode == "real" else "모의"
 
 
 # ===================================================================== #
@@ -592,13 +679,20 @@ class KISApi:
                 "cur_price": float(r.get("now_pric2", 0) or 0),
                 "pnl_rate": float(r.get("evlu_pfls_rt", 0) or 0),
                 "pnl_amt": float(r.get("frcr_evlu_pfls_amt", 0) or 0),
+                "market": "overseas", "currency": "USD",
             })
         summ = d.get("output2") or {}
         if isinstance(summ, list):
             summ = summ[0] if summ else {}
         cash = float(summ.get("frcr_dncl_amt_2") or summ.get("frcr_dncl_amt1")
                      or summ.get("frcr_buy_psbl_amt1") or 0)
-        return {"cash": cash, "positions": pos}
+        total_eval = _first_float(
+            summ,
+            ("tot_evlu_amt", "ovrs_tot_evlu_amt", "frcr_evlu_tota", "frcr_evlu_amt2"),
+        )
+        if not total_eval and (cash or pos):
+            total_eval = cash + sum(_to_float(p.get("cur_price")) * _to_float(p.get("qty")) for p in pos)
+        return {"cash": cash, "total_eval": total_eval, "positions": pos}
 
     def overseas_buyable(self, sym, price, exch="NAS"):
         """해외주식 매수가능금액 조회(통합증거금·환율 반영).
@@ -943,10 +1037,15 @@ class TradeJournal:
         self.lock = threading.Lock()
         self._init_db()
 
+    @contextmanager
     def _conn(self):
         c = sqlite3.connect(self.path, timeout=10)
         c.row_factory = sqlite3.Row
-        return c
+        try:
+            yield c
+            c.commit()
+        finally:
+            c.close()
 
     def _init_db(self):
         with self.lock, self._conn() as c:
@@ -973,30 +1072,46 @@ class TradeJournal:
         except Exception as e:  # noqa
             log.warning("매매일지 기록 실패: %s", e)
 
-    def recent(self, limit=300):
+    def recent(self, limit=300, mode=None):
         try:
             with self.lock, self._conn() as c:
-                rows = c.execute("SELECT * FROM trades ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+                if mode:
+                    rows = c.execute(
+                        "SELECT * FROM trades WHERE mode=? ORDER BY id DESC LIMIT ?",
+                        (mode, limit),
+                    ).fetchall()
+                else:
+                    rows = c.execute("SELECT * FROM trades ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
             return [dict(r) for r in rows]
         except Exception:  # noqa
             return []
 
-    def clear_failed(self):
+    def clear_failed(self, mode=None):
         """체결 실패(ok=0)한 기록만 삭제. 실제 매수/매도 성공 기록은 보존."""
         try:
             with self.lock, self._conn() as c:
-                cur = c.execute("DELETE FROM trades WHERE ok=0")
+                if mode:
+                    cur = c.execute("DELETE FROM trades WHERE ok=0 AND mode=?", (mode,))
+                else:
+                    cur = c.execute("DELETE FROM trades WHERE ok=0")
                 return cur.rowcount
         except Exception:  # noqa
             return 0
 
-    def summary(self, start_date, end_date):
+    def summary(self, start_date, end_date, mode=None):
         """기간(YYYY-MM-DD) 집계."""
         try:
             with self.lock, self._conn() as c:
-                rows = c.execute(
-                    "SELECT * FROM trades WHERE date>=? AND date<=? AND ok=1",
-                    (start_date, end_date)).fetchall()
+                if mode:
+                    rows = c.execute(
+                        "SELECT * FROM trades WHERE date>=? AND date<=? AND ok=1 AND mode=?",
+                        (start_date, end_date, mode),
+                    ).fetchall()
+                else:
+                    rows = c.execute(
+                        "SELECT * FROM trades WHERE date>=? AND date<=? AND ok=1",
+                        (start_date, end_date),
+                    ).fetchall()
         except Exception:  # noqa
             rows = []
         buys = [r for r in rows if r["side"] == "buy"]
@@ -1013,7 +1128,7 @@ class TradeJournal:
             "win_rate": (len(wins) / len(pnls) * 100) if pnls else 0.0,
         }
 
-    def daily_pnl(self, days=14):
+    def daily_pnl(self, days=14, mode=None):
         """최근 days일 일별 실현손익 [(date, pnl), ...]."""
         out = []
         today = datetime.now().date()
@@ -1021,9 +1136,18 @@ class TradeJournal:
             with self.lock, self._conn() as c:
                 for i in range(days - 1, -1, -1):
                     d = (today - timedelta(days=i)).strftime("%Y-%m-%d")
-                    row = c.execute(
-                        "SELECT COALESCE(SUM(pnl),0) p FROM trades WHERE date=? AND side='sell' AND ok=1",
-                        (d,)).fetchone()
+                    if mode:
+                        row = c.execute(
+                            "SELECT COALESCE(SUM(pnl),0) p FROM trades "
+                            "WHERE date=? AND side='sell' AND ok=1 AND mode=?",
+                            (d, mode),
+                        ).fetchone()
+                    else:
+                        row = c.execute(
+                            "SELECT COALESCE(SUM(pnl),0) p FROM trades "
+                            "WHERE date=? AND side='sell' AND ok=1",
+                            (d,),
+                        ).fetchone()
                     out.append((d[5:], row["p"] or 0.0))
         except Exception:  # noqa
             pass
@@ -1248,7 +1372,11 @@ class Trader:
             return self.api.overseas_balance(exch)
         except Exception as e:  # noqa
             log.warning("미국 잔고조회 실패: %s", e)
-            return {"cash": 0, "positions": []}
+            return {"cash": 0, "total_eval": 0, "positions": []}
+
+    def portfolio_balance(self):
+        """대시보드/리포트 표시용 국내+미국 잔고 스냅샷을 반환한다."""
+        return build_portfolio_snapshot(self.safe_balance(), self.safe_overseas_balance())
 
     def scan_once(self):
         # 이미 다른 스캔이 진행 중이면 건너뜀(유량 초과 방지)
@@ -1391,14 +1519,26 @@ class Trader:
         return res
 
     def portfolio_report(self):
-        bal = self.safe_balance()
-        L = [f"💼 포트폴리오({self.s.mode})", f"예수금 {bal['cash']:,.0f}원",
-             f"총평가 {bal['total_eval']:,.0f}원"]
+        bal = self.portfolio_balance()
+        has_usd = bool(bal.get("overseas", {}).get("positions")) or bool(bal.get("cash_usd"))
+        L = [
+            f"💼 포트폴리오({self.s.mode})",
+            "예수금 " + _format_balance_lines(bal.get("cash_krw"), bal.get("cash_usd"), has_usd),
+            "총평가 " + _format_balance_lines(
+                bal.get("total_eval_krw"), bal.get("total_eval_usd"), has_usd
+            ),
+        ]
         if not bal["positions"]:
             L.append("보유 종목 없음")
         for p in bal["positions"]:
-            L.append(f"• {p['name']}({p['code']}) {p['qty']}주 평단 {p['avg_price']:,.0f} "
-                     f"현재 {p['cur_price']:,.0f} ({p['pnl_rate']:+.2f}%)")
+            currency = p.get("currency", "KRW")
+            L.append(
+                f"• [{p.get('market_label', '-')}] {p['name']}({p['code']}) {p['qty']}주 "
+                f"평단 {_format_money(p['avg_price'], currency)} "
+                f"현재 {_format_money(p['cur_price'], currency)} "
+                f"손익 {_format_money(p.get('pnl_amt', 0), currency, signed=True)} "
+                f"({p['pnl_rate']:+.2f}%)"
+            )
         return "\n".join(L)
 
 
@@ -1663,9 +1803,9 @@ class TradingApp:
         # 헤더 바
         top = tk.Frame(self.root, bg=BG)
         top.pack(fill="x", padx=16, pady=(12, 8))
-        title = tk.Label(top, text="📈 자동매매 대시보드", bg=BG, fg=FG,
-                         font=(FONT, 14, "bold"))
-        title.pack(side="left")
+        self.title = tk.Label(top, text="📈 자동매매 대시보드", bg=BG, fg=FG,
+                              font=(FONT, 14, "bold"))
+        self.title.pack(side="left")
         self.dot = tk.Label(top, text="●", bg=BG, fg=GREEN, font=(FONT, 13))
         self.dot.pack(side="left", padx=(16, 4))
         self.status = tk.Label(top, text="준비", bg=BG, fg=SUB, font=(FONT, 10, "bold"))
@@ -1674,6 +1814,11 @@ class TradingApp:
         self.b_scan = self._b(top, "🔍 즉시 스캔", self.scan_now, CARD)
         self.b_auto = self._b(top, "자동매매: --", self.toggle_auto, CARD)
         self.b_eng = self._b(top, "▶ 엔진 시작", self.toggle_engine, ACCENT, dark=True)
+        self.b_mode = self._b(top, "계좌 전환", self.switch_mode, YELLOW, dark=True)
+
+        self.mode_banner = tk.Label(self.root, text="", bg=ACCENT, fg="#11111b",
+                                    font=(FONT, 11, "bold"), padx=12, pady=7, anchor="w")
+        self.mode_banner.pack(fill="x", padx=16, pady=(0, 8))
 
         self.nb = ttk.Notebook(self.root)
         self.nb.pack(fill="both", expand=True, padx=16, pady=(0, 8))
@@ -1712,21 +1857,21 @@ class TradingApp:
         # 상단 카드 4개
         cards = tk.Frame(f, bg=BG)
         cards.pack(fill="x", pady=(12, 6), padx=4)
-        _, self.c_cash = self._card(cards, "💰 예수금(주문가능)")
+        _, self.c_cash = self._card(cards, "💰 예수금")
         _, self.c_eval = self._card(cards, "📊 총평가금액")
         _, self.c_pnl = self._card(cards, "📈 평가손익")
         _, self.c_cnt = self._card(cards, "📦 보유 종목")
 
         head = tk.Frame(f, bg=BG)
         head.pack(fill="x", pady=(8, 2), padx=8)
-        tk.Label(head, text="보유 종목 (모의투자 계좌)", bg=BG, fg=FG,
+        tk.Label(head, text="보유 종목 (국내/미국 모의투자 계좌)", bg=BG, fg=FG,
                  font=(FONT, 11, "bold")).pack(side="left")
         tk.Button(head, text="↻ 새로고침", command=self.refresh_port, bg=CARD, fg=FG,
                   relief="flat", cursor="hand2", padx=10, pady=3, bd=0).pack(side="right")
 
-        cols = ("종목", "수량", "평단가", "현재가", "평가손익", "수익률")
+        cols = ("시장", "종목", "수량", "평단가", "현재가", "평가손익", "수익률")
         self.tree = ttk.Treeview(f, columns=cols, show="headings", height=12)
-        widths = (200, 70, 110, 110, 130, 90)
+        widths = (60, 190, 70, 115, 115, 130, 90)
         for c, w in zip(cols, widths):
             self.tree.heading(c, text=c)
             self.tree.column(c, anchor="center", width=w)
@@ -1736,7 +1881,7 @@ class TradingApp:
         self.tree.pack(fill="both", expand=True, padx=8, pady=8)
 
         # 포트폴리오 비중 막대
-        self.alloc = tk.Canvas(f, bg=PANEL, height=70, highlightthickness=0)
+        self.alloc = tk.Canvas(f, bg=PANEL, height=96, highlightthickness=0)
         self.alloc.pack(fill="x", padx=8, pady=(0, 10))
 
     def _tab_journal(self):
@@ -1744,14 +1889,15 @@ class TradingApp:
         self.nb.add(f, text="📒 매매일지")
         head = tk.Frame(f, bg=BG)
         head.pack(fill="x", pady=(12, 2), padx=8)
-        tk.Label(head, text="매매일지 (체결 성공만 주간리포트 반영)", bg=BG, fg=FG,
-                 font=(FONT, 11, "bold")).pack(side="left")
+        self.journal_title = tk.Label(head, text="", bg=BG, fg=FG,
+                                      font=(FONT, 11, "bold"))
+        self.journal_title.pack(side="left")
         tk.Button(head, text="↻ 새로고침", command=self.refresh_journal, bg=CARD, fg=FG,
                   relief="flat", cursor="hand2", padx=10, pady=3, bd=0).pack(side="right")
         tk.Button(head, text="🗑 실패기록 정리", command=self.clear_failed_journal, bg=CARD, fg=YELLOW,
                   relief="flat", cursor="hand2", padx=10, pady=3, bd=0).pack(side="right", padx=4)
-        cols = ("시각", "시장", "종목", "구분", "수량", "가격", "금액", "실현손익", "사유", "결과")
-        widths = (135, 60, 90, 50, 55, 90, 110, 110, 130, 55)
+        cols = ("모드", "시각", "시장", "종목", "구분", "수량", "가격", "금액", "실현손익", "사유", "결과")
+        widths = (55, 135, 60, 90, 50, 55, 90, 110, 110, 130, 55)
         self.jtree = ttk.Treeview(f, columns=cols, show="headings", height=18)
         for c, w in zip(cols, widths):
             self.jtree.heading(c, text=c)
@@ -1858,6 +2004,16 @@ class TradingApp:
         self.set_mode.set(s.mode)
         self.set_mode.pack(side="left")
         tk.Label(r, text="(paper=모의 / real=실전)", bg=PANEL, fg="#888").pack(side="left", padx=8)
+        r = row("모의 계좌")
+        self.set_paper_account = tk.Entry(r, width=24)
+        self.set_paper_account.insert(0, s.paper_account)
+        self.set_paper_account.pack(side="left")
+        tk.Label(r, text="KIS_PAPER_ACCOUNT", bg=PANEL, fg="#888").pack(side="left", padx=8)
+        r = row("실전 계좌")
+        self.set_real_account = tk.Entry(r, width=24)
+        self.set_real_account.insert(0, s.real_account)
+        self.set_real_account.pack(side="left")
+        tk.Label(r, text="KIS_REAL_ACCOUNT", bg=PANEL, fg=RED).pack(side="left", padx=8)
         r = row("텔레그램 chat_id")
         self.set_chat = tk.Entry(r, width=30)
         self.set_chat.insert(0, ",".join(s.allowed_chat_ids))
@@ -1868,7 +2024,7 @@ class TradingApp:
         self.set_token = tk.Entry(r, width=46, show="•")
         self.set_token.insert(0, s.telegram_token)
         self.set_token.pack(side="left")
-        tk.Label(box, text="※ 앱키/시크릿/계좌는 보안상 .env 파일에서 직접 수정하세요.",
+        tk.Label(box, text="※ 앱키/시크릿은 보안상 .env 파일에서 직접 수정하세요. 계좌는 모의/실전으로 분리 저장됩니다.",
                  bg=PANEL, fg="#888", anchor="w").pack(fill="x", padx=14, pady=(4, 0))
         tk.Button(box, text="💾 저장 (.env 갱신)", command=self.save_settings, bg=GREEN, fg="#000",
                   relief="flat", font=("맑은 고딕", 10, "bold"), cursor="hand2").pack(pady=12)
@@ -1908,11 +2064,14 @@ class TradingApp:
         if miss:
             self.cfg_status.config(text="⚠ 누락/오류: " + ", ".join(miss), fg=RED)
         else:
-            self.cfg_status.config(text="✅ 필수 설정 모두 정상", fg=GREEN)
+            self.cfg_status.config(text=f"✅ 필수 설정 정상 | 현재 적용 계좌: {self.settings.active_account_key}",
+                                   fg=GREEN)
 
     def save_settings(self):
         try:
             new_mode = self.set_mode.get()
+            paper_account = self.set_paper_account.get().strip()
+            real_account = self.set_real_account.get().strip()
             # 실전 전환 시 강력 경고
             if new_mode == "real" and self.settings.mode != "real":
                 if not messagebox.askyesno(
@@ -1922,20 +2081,11 @@ class TradingApp:
                     self.set_mode.set(self.settings.mode)
                     return
             update_env({"TRADING_MODE": new_mode,
+                        "KIS_PAPER_ACCOUNT": paper_account,
+                        "KIS_REAL_ACCOUNT": real_account,
                         "TELEGRAM_ALLOWED_CHAT_IDS": self.set_chat.get().strip(),
                         "TELEGRAM_BOT_TOKEN": self.set_token.get().strip()})
-            # 실행 중인 엔진/봇을 정지하고 재생성해야 새 모드(서버)가 적용됨
-            if self.trader and self.trader.running:
-                self.trader.stop()
-            if self.bot and self.bot.is_running:
-                self.bot.stop()
-            self.trader = None
-            self.bot = None
-            self.settings = load_settings()
-            self.b_eng.config(text="▶ 엔진 시작", bg=ACCENT)
-            self.b_bot.config(text="🤖 봇 시작", bg=CARD)
-            self._cfg_status()
-            self._refresh()
+            self._reload_after_mode_change()
             messagebox.showinfo(
                 "저장 완료",
                 f"저장되었습니다. 현재 모드: {self.settings.mode}\n"
@@ -1943,6 +2093,39 @@ class TradingApp:
             self.q.put(("log", f"설정 저장됨 (모드={self.settings.mode}) — 엔진 재시작 필요"))
         except Exception as e:  # noqa
             messagebox.showerror("저장 실패", str(e))
+
+    def switch_mode(self):
+        current = self.settings.mode
+        new_mode = "real" if current != "real" else "paper"
+        if new_mode == "real":
+            if not messagebox.askyesno(
+                    "⚠️ 실전 계좌로 전환",
+                    "실전 계좌 화면으로 전환합니다.\n"
+                    "엔진과 봇은 중지되고, 이후 주문은 KIS_REAL_ACCOUNT 기준으로 나갈 수 있습니다.\n"
+                    "정말 실전으로 전환하시겠습니까?"):
+                return
+        update_env({"TRADING_MODE": new_mode})
+        self._reload_after_mode_change()
+        self.q.put(("log", f"계좌 모드 전환: {current} → {new_mode}"))
+        messagebox.showinfo("전환 완료", f"{mode_label(new_mode)} 계좌 모드로 전환했습니다.\n엔진을 다시 시작하세요.")
+
+    def _reload_after_mode_change(self):
+        """모드/계좌 변경 뒤 이전 엔진·봇 인스턴스를 버리고 화면을 새 모드로 다시 맞춘다."""
+        if self.trader and self.trader.running:
+            self.trader.stop()
+        if self.bot and self.bot.is_running:
+            self.bot.stop()
+        self.trader = None
+        self.bot = None
+        self.settings = load_settings()
+        self.b_eng.config(text="▶ 엔진 시작", bg=ACCENT)
+        self.b_bot.config(text="🤖 봇 시작", bg=CARD)
+        if hasattr(self, "set_mode"):
+            self.set_mode.set(self.settings.mode)
+        self._cfg_status()
+        self._refresh()
+        self.refresh_journal()
+        self.show_report("daily")
 
     # ---- 엔진/봇 ---- #
     def _ensure(self):
@@ -1952,17 +2135,19 @@ class TradingApp:
 
     # ---- 매매일지 / 리포트 ---- #
     def refresh_journal(self):
-        threading.Thread(target=lambda: self.q.put(("journal", self.journal.recent(300))),
+        mode = self.settings.mode
+        threading.Thread(target=lambda: self.q.put(("journal", self.journal.recent(300, mode))),
                          daemon=True).start()
 
     def clear_failed_journal(self):
         if not messagebox.askyesno("실패기록 정리",
-                                   "체결되지 않은(실패) 기록만 삭제합니다.\n실제 매수/매도 성공 기록은 보존됩니다. 진행할까요?"):
+                                   f"{mode_label(self.settings.mode)} 모드의 실패 기록만 삭제합니다.\n"
+                                   "실제 매수/매도 성공 기록은 보존됩니다. 진행할까요?"):
             return
 
         def work():
-            n = self.journal.clear_failed()
-            self.q.put(("log", f"실패/미체결 기록 {n}건 정리"))
+            n = self.journal.clear_failed(self.settings.mode)
+            self.q.put(("log", f"{mode_label(self.settings.mode)} 실패/미체결 기록 {n}건 정리"))
             self.refresh_journal()
             self.show_report("daily")
         threading.Thread(target=work, daemon=True).start()
@@ -1970,11 +2155,11 @@ class TradingApp:
     def show_report(self, period):
         def work():
             if period == "weekly":
-                start, title = week_start_str(), "주간 리포트 (최근 7일)"
+                start, title = week_start_str(), f"{mode_label(self.settings.mode)} 주간 리포트 (최근 7일)"
             else:
-                start, title = today_str(), "일일 리포트 (오늘)"
-            summ = self.journal.summary(start, today_str())
-            chart = self.journal.daily_pnl(14)
+                start, title = today_str(), f"{mode_label(self.settings.mode)} 일일 리포트 (오늘)"
+            summ = self.journal.summary(start, today_str(), self.settings.mode)
+            chart = self.journal.daily_pnl(14, self.settings.mode)
             self.q.put(("report", (title, summ, chart)))
         threading.Thread(target=work, daemon=True).start()
 
@@ -2077,7 +2262,7 @@ class TradingApp:
 
     def refresh_port(self):
         t = self._ensure()
-        threading.Thread(target=lambda: self.q.put(("portfolio", t.safe_balance())), daemon=True).start()
+        threading.Thread(target=lambda: self.q.put(("portfolio", t.portfolio_balance())), daemon=True).start()
 
     # ---- 알림/큐 ---- #
     def _notify(self, msg):
@@ -2121,13 +2306,14 @@ class TradingApp:
             side = "매수" if r["side"] == "buy" else "매도"
             mkt = "국내" if r["market"] == "domestic" else "미국"
             res = "✅" if r["ok"] else "❌"
+            mode = mode_label(r.get("mode"))
             tags = []
             if pnl is not None:
                 tags.append("pos" if pnl > 0 else "neg")
             elif idx % 2:
                 tags.append("odd")
             self.jtree.insert("", "end", tags=tags, values=(
-                r["ts"], mkt, f"{r['name']}({r['code']})", side, r["qty"],
+                mode, r["ts"], mkt, f"{r['name']}({r['code']})", side, r["qty"],
                 f"{r['price']:,.2f}", f"{r['amount']:,.0f}", pnl_s,
                 (r.get("reason") or "")[:18], res))
 
@@ -2176,46 +2362,83 @@ class TradingApp:
 
     def _render_port(self, bal):
         positions = bal.get("positions", [])
-        total_pnl = sum(p.get("pnl_amt", 0) for p in positions)
-        self.c_cash.config(text=f"{bal.get('cash', 0):,.0f}원")
-        self.c_eval.config(text=f"{bal.get('total_eval', 0):,.0f}원")
-        self.c_pnl.config(text=f"{total_pnl:+,.0f}원",
-                          fg=(GREEN if total_pnl > 0 else RED if total_pnl < 0 else FG))
+        has_usd = any(p.get("currency") == "USD" for p in positions) or bool(bal.get("cash_usd"))
+        pnl_values = [_to_float(bal.get("pnl_krw")), _to_float(bal.get("pnl_usd"))]
+        non_zero_pnl = [v for v in pnl_values if v]
+        pnl_color = FG
+        if non_zero_pnl and all(v > 0 for v in non_zero_pnl):
+            pnl_color = GREEN
+        elif non_zero_pnl and all(v < 0 for v in non_zero_pnl):
+            pnl_color = RED
+
+        self.c_cash.config(
+            text=_format_balance_lines(bal.get("cash_krw"), bal.get("cash_usd"), has_usd)
+        )
+        self.c_eval.config(
+            text=_format_balance_lines(bal.get("total_eval_krw"), bal.get("total_eval_usd"), has_usd)
+        )
+        self.c_pnl.config(
+            text=_format_balance_lines(bal.get("pnl_krw"), bal.get("pnl_usd"), has_usd, signed=True),
+            fg=pnl_color,
+        )
         self.c_cnt.config(text=f"{len(positions)}종목")
 
         for i in self.tree.get_children():
             self.tree.delete(i)
         for idx, p in enumerate(positions):
             rate = p["pnl_rate"]
-            tag = "pos" if rate > 0 else "neg" if rate < 0 else ("odd" if idx % 2 else "")
-            self.tree.insert("", "end", tags=(tag,), values=(
-                f"{p['name']}({p['code']})", p["qty"], f"{p['avg_price']:,.0f}",
-                f"{p['cur_price']:,.0f}", f"{p.get('pnl_amt', 0):+,.0f}", f"{rate:+.2f}%"))
+            tag = "pos" if rate > 0 else "neg" if rate < 0 else ""
+            tags = [tag] if tag else []
+            if idx % 2:
+                tags.append("odd")
+            currency = p.get("currency", "KRW")
+            self.tree.insert("", "end", tags=tuple(tags), values=(
+                p.get("market_label", "-"), f"{p['name']}({p['code']})", p["qty"],
+                _format_money(p["avg_price"], currency),
+                _format_money(p["cur_price"], currency),
+                _format_money(p.get("pnl_amt", 0), currency, signed=True),
+                f"{rate:+.2f}%",
+            ))
         self._draw_alloc(positions)
 
     def _draw_alloc(self, positions):
         c = self.alloc
         c.delete("all")
         w = c.winfo_width() or 980
-        h = 70
-        vals = [(p["name"], p["cur_price"] * p["qty"]) for p in positions]
-        total = sum(v for _, v in vals)
-        if total <= 0:
+        h = c.winfo_height() or 96
+        groups = []
+        for currency, label in (("KRW", "국내 비중"), ("USD", "미국 비중")):
+            vals = [
+                (p["name"], _to_float(p.get("position_value")))
+                for p in positions
+                if p.get("currency", "KRW") == currency
+            ]
+            vals = [(name, value) for name, value in vals if value > 0]
+            total = sum(value for _, value in vals)
+            if total > 0:
+                groups.append((label, vals, total))
+        if not groups:
             c.create_text(w / 2, h / 2, text="보유 종목 없음", fill=SUB, font=(FONT, 10))
             return
         colors = [ACCENT, GREEN, YELLOW, MAUVE, RED, "#94e2d5", "#fab387"]
-        x = 10
         bar_w = w - 20
-        y0, y1 = 18, 42
-        for i, (name, v) in enumerate(vals):
-            seg = bar_w * (v / total)
-            col = colors[i % len(colors)]
-            c.create_rectangle(x, y0, x + seg, y1, fill=col, outline=BG)
-            if seg > 45:
-                c.create_text(x + seg / 2, (y0 + y1) / 2, text=f"{name}\n{v/total*100:.0f}%",
-                              fill="#11111b", font=(FONT, 7, "bold"))
-            x += seg
-        c.create_text(10, 58, anchor="w", text="포트폴리오 비중", fill=SUB, font=(FONT, 8))
+        row_gap = 38
+        start_y = 18 if len(groups) == 1 else 10
+        for row, (label, vals, total) in enumerate(groups):
+            x = 10
+            y0 = start_y + row * row_gap
+            y1 = y0 + 18
+            for i, (name, value) in enumerate(vals):
+                seg = bar_w * (value / total)
+                col = colors[i % len(colors)]
+                c.create_rectangle(x, y0, x + seg, y1, fill=col, outline=BG)
+                if seg > 55:
+                    c.create_text(
+                        x + seg / 2, (y0 + y1) / 2, text=f"{name} {value/total*100:.0f}%",
+                        fill="#11111b", font=(FONT, 7, "bold"),
+                    )
+                x += seg
+            c.create_text(10, y1 + 13, anchor="w", text=label, fill=SUB, font=(FONT, 8))
 
     def _render_sig(self, sigs):
         for i in self.sig_tree.get_children():
@@ -2237,6 +2460,30 @@ class TradingApp:
         run = self.trader and self.trader.running
         auto = self.trader and self.trader.auto_enabled
         bot = self.bot and self.bot.is_running
+        if s.is_paper:
+            title = "📈 모의 자동매매 대시보드"
+            banner = "모의투자 화면 | KIS_PAPER_ACCOUNT 적용 | 실전 계좌와 매매기록 분리"
+            banner_bg = ACCENT
+            banner_fg = "#11111b"
+            switch_text = "🔁 실전 계좌로 전환"
+            switch_bg = RED
+            title_fg = ACCENT
+        else:
+            title = "⚠ 실전 자동매매 대시보드"
+            banner = "실전투자 화면 | KIS_REAL_ACCOUNT 적용 | 실제 주문 가능"
+            banner_bg = RED
+            banner_fg = "#11111b"
+            switch_text = "🔁 모의 계좌로 복귀"
+            switch_bg = GREEN
+            title_fg = RED
+        self.title.config(text=title, fg=title_fg)
+        self.mode_banner.config(text=banner, bg=banner_bg, fg=banner_fg)
+        self.b_mode.config(text=switch_text, bg=switch_bg, fg="#11111b")
+        if hasattr(self, "journal_title"):
+            self.journal_title.config(
+                text=f"{mode_label(s.mode)} 매매일지 (현재 모드 기록만 표시, 체결 성공만 리포트 반영)",
+                fg=title_fg,
+            )
         self.dot.config(fg=GREEN if s.is_paper else RED)
         self.status.config(text=f"[{s.mode}] 엔진:{'가동' if run else '정지'}  봇:{'ON' if bot else 'OFF'}")
         self.b_auto.config(text=f"자동매매: {'ON' if auto else 'OFF'}", bg=GREEN if auto else PANEL)

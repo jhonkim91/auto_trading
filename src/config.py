@@ -5,9 +5,8 @@ from dataclasses import dataclass, field
 import yaml
 from dotenv import load_dotenv
 
-load_dotenv()
-
 _BASE = os.path.dirname(os.path.dirname(__file__))
+load_dotenv(os.path.join(_BASE, ".env"))
 
 # KIS 도메인 (공식)
 REAL_BASE_URL = "https://openapi.koreainvestment.com:9443"
@@ -31,6 +30,8 @@ class Settings:
     risk: dict = field(default_factory=dict)
     engine: dict = field(default_factory=dict)
     universe: dict = field(default_factory=dict)
+    paper_account: str = ""
+    real_account: str = ""
 
     @property
     def is_paper(self) -> bool:
@@ -44,6 +45,10 @@ class Settings:
     def ws_url(self) -> str:
         return PAPER_WS_URL if self.is_paper else REAL_WS_URL
 
+    @property
+    def active_account_key(self) -> str:
+        return "KIS_PAPER_ACCOUNT" if self.is_paper else "KIS_REAL_ACCOUNT"
+
 
 def _split_account(raw: str):
     """'12345678-01' -> ('12345678', '01')"""
@@ -55,17 +60,20 @@ def _split_account(raw: str):
 
 
 def load_settings() -> Settings:
+    load_dotenv(env_path(), override=True)
     mode = os.getenv("TRADING_MODE", "paper").lower()
+    paper_account = os.getenv("KIS_PAPER_ACCOUNT", "")
+    real_account = os.getenv("KIS_REAL_ACCOUNT", "")
 
     if mode == "real":
         app_key = os.getenv("KIS_REAL_APP_KEY", "")
         app_secret = os.getenv("KIS_REAL_APP_SECRET", "")
-        account_raw = os.getenv("KIS_REAL_ACCOUNT", "")
+        account_raw = real_account
     else:
         mode = "paper"
         app_key = os.getenv("KIS_PAPER_APP_KEY", "")
         app_secret = os.getenv("KIS_PAPER_APP_SECRET", "")
-        account_raw = os.getenv("KIS_PAPER_ACCOUNT", "")
+        account_raw = paper_account
 
     account_no, account_prod = _split_account(account_raw)
 
@@ -89,6 +97,8 @@ def load_settings() -> Settings:
         risk=cfg.get("risk", {}),
         engine=cfg.get("engine", {}),
         universe=cfg.get("universe", {}),
+        paper_account=paper_account,
+        real_account=real_account,
     )
 
 

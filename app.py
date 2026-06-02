@@ -19,6 +19,7 @@ from tkinter import ttk, messagebox
 
 from src.config import load_settings, validate, update_env
 from src.logger import get_logger
+from src.trader import _format_balance_lines, _format_money, _to_float
 
 log = get_logger("gui")
 
@@ -28,6 +29,10 @@ ACCENT = "#89b4fa"
 GREEN = "#a6e3a1"
 RED = "#f38ba8"
 PANEL = "#27293d"
+
+
+def mode_label(mode):
+    return "실전" if mode == "real" else "모의"
 
 
 class QueueLogHandler(logging.Handler):
@@ -104,9 +109,15 @@ class TradingApp:
         self.status_lbl.pack(side="left", padx=(6, 20))
 
         self.btn_engine = self._btn(top, "▶ 엔진 시작", self.toggle_engine, ACCENT)
+        self.btn_mode = self._btn(top, "계좌 전환", self.switch_mode, GREEN)
         self.btn_auto = self._btn(top, "자동매매: --", self.toggle_auto, PANEL)
         self.btn_scan = self._btn(top, "🔍 즉시 스캔", self.scan_now, PANEL)
         self.btn_bot = self._btn(top, "🤖 봇 시작", self.toggle_bot, PANEL)
+
+        self.mode_banner = tk.Label(self.root, text="", bg=ACCENT, fg="#000000",
+                                    anchor="w", padx=10, pady=6,
+                                    font=("맑은 고딕", 10, "bold"))
+        self.mode_banner.pack(fill="x", padx=12, pady=(0, 8))
 
         # ---- 탭 ----
         self.nb = ttk.Notebook(self.root)
@@ -141,11 +152,11 @@ class TradingApp:
         tk.Button(summary, text="↻ 새로고침", command=self.refresh_portfolio, bg=PANEL,
                   fg=FG, relief="flat", cursor="hand2").pack(side="right", padx=10)
 
-        cols = ("종목", "수량", "평단", "현재가", "수익률")
+        cols = ("시장", "종목", "수량", "평단", "현재가", "평가손익", "수익률")
         self.tree = ttk.Treeview(f, columns=cols, show="headings", height=14)
         for c in cols:
             self.tree.heading(c, text=c)
-            self.tree.column(c, anchor="center", width=120)
+            self.tree.column(c, anchor="center", width=105 if c != "종목" else 180)
         self.tree.pack(fill="both", expand=True, padx=8, pady=8)
 
     def _build_signals(self):
@@ -210,6 +221,18 @@ class TradingApp:
         self.set_mode.set(s.mode if s else "paper"); self.set_mode.pack(side="left")
         tk.Label(r, text="(paper=모의 / real=실전)", bg=PANEL, fg="#888").pack(side="left", padx=8)
 
+        r = row("모의 계좌")
+        self.set_paper_account = tk.Entry(r, width=24)
+        self.set_paper_account.insert(0, s.paper_account if s else "")
+        self.set_paper_account.pack(side="left")
+        tk.Label(r, text="KIS_PAPER_ACCOUNT", bg=PANEL, fg="#888").pack(side="left", padx=8)
+
+        r = row("실전 계좌")
+        self.set_real_account = tk.Entry(r, width=24)
+        self.set_real_account.insert(0, s.real_account if s else "")
+        self.set_real_account.pack(side="left")
+        tk.Label(r, text="KIS_REAL_ACCOUNT", bg=PANEL, fg=RED).pack(side="left", padx=8)
+
         r = row("텔레그램 chat_id")
         self.set_chat = tk.Entry(r, width=36)
         self.set_chat.insert(0, ",".join(s.allowed_chat_ids) if s else "")
@@ -221,7 +244,7 @@ class TradingApp:
         self.set_token.insert(0, s.telegram_token if s else "")
         self.set_token.pack(side="left")
 
-        info = tk.Label(box, text="※ 앱키/시크릿/계좌는 보안상 .env 파일에서 직접 수정하세요.",
+        info = tk.Label(box, text="※ 앱키/시크릿은 보안상 .env 파일에서 직접 수정하세요. 계좌는 모의/실전으로 분리 저장됩니다.",
                         bg=PANEL, fg="#888", anchor="w")
         info.pack(fill="x", padx=14, pady=(4, 0))
 
@@ -253,25 +276,73 @@ class TradingApp:
             txt = "⚠ 누락: " + ", ".join(missing)
             color = RED
         else:
-            txt = "✅ 필수 설정 모두 입력됨"
+            txt = f"✅ 필수 설정 모두 입력됨 | 현재 적용 계좌: {self.settings.active_account_key}"
             color = GREEN
         self.cfg_status.config(text=txt, fg=color)
 
     def save_settings(self):
+        new_mode = self.set_mode.get()
+        if new_mode == "real" and self.settings and self.settings.mode != "real":
+            if not messagebox.askyesno(
+                    "⚠️ 실전투자 전환",
+                    "real(실전) 모드는 실제 돈으로 주문이 나갈 수 있습니다.\n"
+                    "모의 계좌와 실전 계좌가 분리되어 있는지 확인했습니다.\n정말 전환하시겠습니까?"):
+                self.set_mode.set(self.settings.mode)
+                return
         updates = {
-            "TRADING_MODE": self.set_mode.get(),
+            "TRADING_MODE": new_mode,
+            "KIS_PAPER_ACCOUNT": self.set_paper_account.get().strip(),
+            "KIS_REAL_ACCOUNT": self.set_real_account.get().strip(),
             "TELEGRAM_ALLOWED_CHAT_IDS": self.set_chat.get().strip(),
             "TELEGRAM_BOT_TOKEN": self.set_token.get().strip(),
         }
         try:
             update_env(updates)
+            if self.trader and self.trader.running:
+                self.trader.stop()
+            if self.bot and self.bot.is_running:
+                self.bot.stop()
+            self.trader = None
+            self.bot = None
             self.settings = load_settings()
             self._update_cfg_status()
+            self.btn_engine.config(text="▶ 엔진 시작", bg=ACCENT)
+            self.btn_bot.config(text="🤖 봇 시작", bg=PANEL)
+            self._refresh_status()
             messagebox.showinfo("저장 완료",
-                                "설정을 저장했습니다.\n변경을 완전히 적용하려면 프로그램을 재시작하세요.")
-            self._log("설정 저장됨 (.env)")
+                                "설정을 저장했습니다.\n선택한 모드의 계좌가 새 엔진에 적용됩니다.")
+            self._log(f"설정 저장됨 (.env, 모드={self.settings.mode}) — 엔진 재시작 필요")
         except Exception as e:  # noqa
             messagebox.showerror("저장 실패", str(e))
+
+    def switch_mode(self):
+        current = self.settings.mode
+        new_mode = "real" if current != "real" else "paper"
+        if new_mode == "real":
+            if not messagebox.askyesno(
+                    "⚠️ 실전 계좌로 전환",
+                    "실전 계좌 화면으로 전환합니다.\n"
+                    "엔진과 봇은 중지되고, 이후 주문은 KIS_REAL_ACCOUNT 기준으로 나갈 수 있습니다.\n"
+                    "정말 실전으로 전환하시겠습니까?"):
+                return
+        try:
+            update_env({"TRADING_MODE": new_mode})
+            if self.trader and self.trader.running:
+                self.trader.stop()
+            if self.bot and self.bot.is_running:
+                self.bot.stop()
+            self.trader = None
+            self.bot = None
+            self.settings = load_settings()
+            self.set_mode.set(self.settings.mode)
+            self.btn_engine.config(text="▶ 엔진 시작", bg=ACCENT)
+            self.btn_bot.config(text="🤖 봇 시작", bg=PANEL)
+            self._update_cfg_status()
+            self._refresh_status()
+            self._log(f"계좌 모드 전환: {current} → {new_mode}")
+            messagebox.showinfo("전환 완료", f"{mode_label(new_mode)} 계좌 모드로 전환했습니다.\n엔진을 다시 시작하세요.")
+        except Exception as e:  # noqa
+            messagebox.showerror("전환 실패", str(e))
 
     # ------------------------------------------------------------- #
     #  엔진 제어
@@ -382,7 +453,7 @@ class TradingApp:
         t = self._ensure_trader()
 
         def work():
-            bal = t.safe_domestic_balance()
+            bal = t.portfolio_balance()
             self.q.put(("portfolio", bal))
         threading.Thread(target=work, daemon=True).start()
 
@@ -427,14 +498,27 @@ class TradingApp:
         self.log_txt.configure(state="disabled")
 
     def _render_portfolio(self, bal):
-        self.cash_lbl.config(text=f"예수금: {bal.get('cash', 0):,.0f}원")
-        self.eval_lbl.config(text=f"총평가: {bal.get('total_eval', 0):,.0f}원")
+        positions = bal.get("positions", [])
+        has_usd = any(p.get("currency") == "USD" for p in positions) or bool(bal.get("cash_usd"))
+        self.cash_lbl.config(
+            text="예수금: " + _format_balance_lines(bal.get("cash_krw"), bal.get("cash_usd"), has_usd)
+        )
+        self.eval_lbl.config(
+            text="총평가: " + _format_balance_lines(
+                bal.get("total_eval_krw"), bal.get("total_eval_usd"), has_usd
+            )
+        )
         for i in self.tree.get_children():
             self.tree.delete(i)
-        for p in bal.get("positions", []):
+        for p in positions:
+            currency = p.get("currency", "KRW")
             self.tree.insert("", "end", values=(
-                f"{p['name']}({p['code']})", p["qty"], f"{p['avg_price']:,.0f}",
-                f"{p['cur_price']:,.0f}", f"{p['pnl_rate']:+.2f}%"))
+                p.get("market_label", "-"), f"{p['name']}({p['code']})", p["qty"],
+                _format_money(p["avg_price"], currency),
+                _format_money(p["cur_price"], currency),
+                _format_money(p.get("pnl_amt", 0), currency, signed=True),
+                f"{_to_float(p.get('pnl_rate')):+.2f}%",
+            ))
 
     def _render_signals(self, sigs):
         for i in self.sig_tree.get_children():
@@ -449,6 +533,13 @@ class TradingApp:
         running = self.trader and self.trader.running
         auto = self.trader and self.trader.auto_enabled
         bot_on = self.bot and self.bot.is_running
+        if s and s.is_paper:
+            self.mode_banner.config(text="모의투자 화면 | KIS_PAPER_ACCOUNT 적용", bg=ACCENT, fg="#000000")
+            self.btn_mode.config(text="🔁 실전 계좌로 전환", bg=RED, fg="#000000")
+        else:
+            self.mode_banner.config(text="실전투자 화면 | KIS_REAL_ACCOUNT 적용 | 실제 주문 가능",
+                                    bg=RED, fg="#000000")
+            self.btn_mode.config(text="🔁 모의 계좌로 복귀", bg=GREEN, fg="#000000")
         self.mode_lbl.config(fg=GREEN if s and s.is_paper else RED)
         self.status_lbl.config(
             text=f"[{s.mode if s else '?'}] 엔진:{'가동' if running else '정지'}  "
