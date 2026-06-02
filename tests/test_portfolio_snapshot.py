@@ -9,7 +9,9 @@ from unittest.mock import patch
 from autotrader import Settings as GuiSettings
 from autotrader import KISApi as GuiKISApi
 from autotrader import RiskManager as GuiRiskManager
+from autotrader import Trader as GuiTrader
 from autotrader import TradeJournal
+from autotrader import DEFAULT_CONFIG
 from autotrader import build_portfolio_snapshot as build_gui_snapshot
 from autotrader import _format_balance_lines
 from autotrader import _deep_merge
@@ -102,6 +104,27 @@ class PortfolioSnapshotTests(unittest.TestCase):
 
         self.assertEqual(merged["strategy"]["buy_threshold"], 4)
         self.assertEqual(merged["strategy"]["indicators"]["rsi"]["enabled"], True)
+
+    def test_autotrader_deep_merge_preserves_indicators(self):
+        """config.yaml에 buy_threshold만 있어도 indicators 기본값을 유지한다."""
+        import copy
+
+        base = copy.deepcopy(DEFAULT_CONFIG)
+        override = {"strategy": {"buy_threshold": 4}}
+        merged = _deep_merge(base, override)
+
+        self.assertEqual(merged["strategy"]["buy_threshold"], 4)
+        self.assertIn("ma_cross", merged["strategy"]["indicators"])
+        self.assertIn("adx", merged["strategy"]["indicators"])
+
+    def test_autotrader_shallow_update_would_lose_indicators(self):
+        """얕은 update가 indicators를 잃는 문제를 문서화한다."""
+        import copy
+
+        base = copy.deepcopy(DEFAULT_CONFIG)
+        base.update({"strategy": {"buy_threshold": 4}})
+
+        self.assertNotIn("indicators", base["strategy"])
 
     def test_trade_journal_filters_records_by_mode(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -227,6 +250,34 @@ class PortfolioSnapshotTests(unittest.TestCase):
         self.assertEqual(balance["cash"], 100)
         self.assertEqual(balance["total_eval"], 770)
         self.assertEqual([(p["exchange"], p["code"]) for p in balance["positions"]], [("NAS", "QQQ"), ("NYS", "BABA")])
+
+    def test_gui_safe_overseas_balance_merges_all_default_exchanges(self):
+        class FakeApi:
+            def overseas_balance(self, exchange):
+                balances = {
+                    "NAS": {
+                        "cash": 100,
+                        "positions": [{"code": "QQQ", "qty": 1, "cur_price": 510}],
+                    },
+                    "NYS": {
+                        "cash": 120,
+                        "positions": [{"code": "BABA", "qty": 2, "cur_price": 80}],
+                    },
+                    "AMS": {"cash": 110, "positions": []},
+                }
+                return balances[exchange]
+
+        trader = GuiTrader.__new__(GuiTrader)
+        trader.api = FakeApi()
+
+        balance = trader.safe_overseas_balance()
+
+        self.assertEqual(balance["cash"], 120)
+        self.assertEqual(balance["total_eval"], 790)
+        self.assertEqual(
+            [(position["exchange"], position["code"]) for position in balance["positions"]],
+            [("NAS", "QQQ"), ("NYS", "BABA")],
+        )
 
     def test_liquidate_all_sells_domestic_and_overseas_positions(self):
         class FakeApi:

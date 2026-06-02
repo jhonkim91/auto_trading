@@ -1559,12 +1559,31 @@ class Trader:
         return [{"symbol": x["code"], "exchange": exch} for x in pool[:topk]]
 
     def safe_overseas_balance(self):
-        exch = (self.s.screener or {}).get("overseas_market", "NAS")
-        try:
-            return self.api.overseas_balance(exch)
-        except Exception as e:  # noqa
-            log.warning("미국 잔고조회 실패: %s", e)
-            return {"cash": 0, "total_eval": 0, "positions": []}
+        """NAS/NYS/AMS 잔고를 병합하되 USD 현금은 중복 합산하지 않는다."""
+        positions, seen, cash_values = [], set(), []
+        for exch in ("NAS", "NYS", "AMS"):
+            try:
+                balance = self.api.overseas_balance(exch)
+                cash_values.append(_to_float(balance.get("cash")))
+                for position in balance.get("positions") or []:
+                    item = dict(position)
+                    item["exchange"] = exch
+                    key = (exch, item.get("code"))
+                    if key not in seen:
+                        seen.add(key)
+                        positions.append(item)
+            except Exception as e:  # noqa
+                log.warning("미국 잔고조회 실패(%s): %s", exch, e)
+        cash = max(cash_values) if cash_values else 0.0
+        position_value = sum(
+            _to_float(position.get("cur_price")) * _to_float(position.get("qty"))
+            for position in positions
+        )
+        return {
+            "cash": cash,
+            "total_eval": cash + position_value if (cash or position_value) else 0,
+            "positions": positions,
+        }
 
     def portfolio_balance(self):
         """대시보드/리포트 표시용 국내+미국 잔고 스냅샷을 반환한다."""
