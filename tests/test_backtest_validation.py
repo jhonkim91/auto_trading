@@ -7,7 +7,7 @@ import unittest
 import numpy as np
 import pandas as pd
 
-from src import costs, metrics
+from src import costs, metrics, slippage
 
 
 class CostTests(unittest.TestCase):
@@ -84,6 +84,34 @@ class MetricsTests(unittest.TestCase):
 
         self.assertGreater(dsr, 0)
         self.assertLessEqual(dsr, 1.0)
+
+
+class SlippageTests(unittest.TestCase):
+    def _make_df(self, n=30, seed=1):
+        np.random.seed(seed)
+        close = 10000 * np.cumprod(1 + np.random.normal(0, 0.01, n))
+        high = close * (1 + np.abs(np.random.normal(0, 0.005, n)))
+        low = close * (1 - np.abs(np.random.normal(0, 0.005, n)))
+        return pd.DataFrame({"open": close * 0.999, "high": high, "low": low, "close": close})
+
+    def test_cs_spread_non_negative(self):
+        frame = self._make_df()
+        spread = slippage.corwin_schultz_spread(frame)
+
+        self.assertTrue((spread.dropna() >= 0).all())
+
+    def test_one_way_slippage_above_min(self):
+        frame = self._make_df()
+        estimated = slippage.one_way_slippage_pct(frame, min_bps=5.0)
+
+        self.assertTrue((estimated.dropna() >= 5.0 / 10000).all())
+
+    def test_estimate_from_candles_returns_float(self):
+        candles = self._make_df().to_dict("records")
+        value = slippage.estimate_from_candles(candles, min_bps=5.0)
+
+        self.assertIsInstance(value, float)
+        self.assertGreater(value, 0)
 
 
 if __name__ == "__main__":
