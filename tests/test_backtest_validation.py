@@ -7,7 +7,7 @@ import unittest
 import numpy as np
 import pandas as pd
 
-from src import costs, metrics, slippage
+from src import costs, metrics, montecarlo as mc, slippage
 
 
 class CostTests(unittest.TestCase):
@@ -112,6 +112,61 @@ class SlippageTests(unittest.TestCase):
 
         self.assertIsInstance(value, float)
         self.assertGreater(value, 0)
+
+
+class MonteCarloTests(unittest.TestCase):
+    def _make_trades(self, n=50, seed=42):
+        np.random.seed(seed)
+        wins = np.random.uniform(1000, 3000, n // 2)
+        losses = np.random.uniform(-2000, -500, n - n // 2)
+        return np.concatenate([wins, losses])
+
+    def test_reshuffle_mc_fixed_seed_deterministic(self):
+        trades = self._make_trades()
+        first = mc.reshuffle_mc(trades, n_sims=100, seed=42)
+        second = mc.reshuffle_mc(trades, n_sims=100, seed=42)
+
+        self.assertAlmostEqual(first.mdd_p95, second.mdd_p95, places=8)
+
+    def test_reshuffle_mdd_worse_than_zero(self):
+        trades = self._make_trades()
+        result = mc.reshuffle_mc(trades, n_sims=200, seed=0)
+
+        self.assertLess(result.mdd_median, 0)
+
+    def test_block_bootstrap_non_negative_prob_of_ruin(self):
+        np.random.seed(1)
+        returns = np.random.normal(0.001, 0.015, 100)
+        result = mc.block_bootstrap_mc(returns, n_sims=100, seed=0)
+
+        self.assertGreaterEqual(result.prob_of_ruin, 0)
+        self.assertLessEqual(result.prob_of_ruin, 1)
+
+    def test_prob_of_ruin_low_for_safe_strategy(self):
+        ror = mc.prob_of_ruin(
+            0.60,
+            2.0,
+            1.0,
+            risk_per_trade=0.01,
+            n_trades=100,
+            n_sims=1000,
+            seed=42,
+        )
+
+        self.assertLess(ror, 0.10)
+
+    def test_prob_of_ruin_high_for_risky(self):
+        ror = mc.prob_of_ruin(
+            0.40,
+            1.5,
+            2.0,
+            risk_per_trade=0.05,
+            n_trades=200,
+            n_sims=1000,
+            seed=0,
+        )
+
+        self.assertGreater(ror, 0.05)
 
 
 if __name__ == "__main__":
