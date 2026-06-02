@@ -10,7 +10,7 @@ git diff --check
 ```
 
 ### 결과
-- `py -m unittest discover -s tests -p "test_*.py"`: 33 tests OK
+- `py -m unittest discover -s tests -p "test_*.py"`: 35 tests OK
 - `py -m compileall autotrader.py app.py run.py src tests`: OK
 - `git diff --check`: 종료 코드 0
 

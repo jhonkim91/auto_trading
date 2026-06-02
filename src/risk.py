@@ -13,9 +13,11 @@ from . import indicators as ind
 
 
 class RiskManager:
-    def __init__(self, risk_cfg: dict, state_path: str = None):
+    def __init__(self, risk_cfg: dict, state_path: str = None, state_store=None, mode: str = None):
         self.cfg = risk_cfg or {}
         self.state_path = state_path
+        self.state_store = state_store
+        self.mode = mode
         self.state_date = None
         self.day_start_equity = None     # 당일 시작 자산
         self.peak_equity = None          # 최고 자산(MDD 계산용)
@@ -26,11 +28,21 @@ class RiskManager:
         return datetime.now().strftime("%Y-%m-%d")
 
     def _load_state(self):
-        if not self.state_path or not os.path.exists(self.state_path):
+        data = None
+        if self.state_store and self.mode:
+            try:
+                data = self.state_store.load_equity_state(self.mode)
+            except Exception:  # noqa
+                data = None
+        if not data and self.state_path and os.path.exists(self.state_path):
+            try:
+                with open(self.state_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:  # noqa
+                data = None
+        if not data:
             return
         try:
-            with open(self.state_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
             self.state_date = data.get("date")
             self.day_start_equity = data.get("day_start_equity")
             self.peak_equity = data.get("peak_equity")
@@ -42,19 +54,26 @@ class RiskManager:
             self.halted = False
 
     def _save_state(self):
-        if not self.state_path:
-            return
-        state_dir = os.path.dirname(self.state_path)
-        if state_dir:
-            os.makedirs(state_dir, exist_ok=True)
         data = {
             "date": self.state_date,
             "day_start_equity": self.day_start_equity,
             "peak_equity": self.peak_equity,
             "halted": self.halted,
         }
-        with open(self.state_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        if self.state_store and self.mode and self.state_date:
+            self.state_store.save_equity_state(
+                self.state_date,
+                self.mode,
+                self.day_start_equity,
+                self.peak_equity,
+                self.halted,
+            )
+        if self.state_path:
+            state_dir = os.path.dirname(self.state_path)
+            if state_dir:
+                os.makedirs(state_dir, exist_ok=True)
+            with open(self.state_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
 
     # ---- 포지션 사이징 ---- #
     def position_size(self, equity: float, price: float, candles: list = None) -> int:

@@ -172,6 +172,34 @@ class PortfolioSnapshotTests(unittest.TestCase):
             self.assertEqual(loaded.peak, 1_000_000)
             self.assertTrue(loaded.halted)
 
+    def test_module_risk_state_persists_to_equity_state_table(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = ModuleTradeJournal(os.path.join(tmp, "trades.db"))
+            cfg = {"daily_loss_limit_pct": 3.0, "max_drawdown_pct": 15.0}
+            risk = RiskManager(cfg, state_store=journal, mode="paper")
+
+            self.assertEqual(risk.check_limits(1_000_000), "")
+            self.assertEqual(risk.check_limits(960_000), "daily_loss")
+
+            loaded = RiskManager(cfg, state_store=journal, mode="paper")
+            self.assertEqual(loaded.day_start_equity, 1_000_000)
+            self.assertEqual(loaded.peak_equity, 1_000_000)
+            self.assertTrue(loaded.halted)
+
+    def test_gui_risk_state_persists_to_equity_state_table(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = TradeJournal(os.path.join(tmp, "trades.db"))
+            cfg = {"daily_loss_limit_pct": 3.0, "max_drawdown_pct": 15.0}
+            risk = GuiRiskManager(cfg, state_store=journal, mode="real")
+
+            self.assertEqual(risk.check_limits(1_000_000), "")
+            self.assertEqual(risk.check_limits(960_000), "일일손실한도")
+
+            loaded = GuiRiskManager(cfg, state_store=journal, mode="real")
+            self.assertEqual(loaded.day_start, 1_000_000)
+            self.assertEqual(loaded.peak, 1_000_000)
+            self.assertTrue(loaded.halted)
+
     def test_safe_overseas_balance_merges_configured_exchanges_without_cash_duplication(self):
         class FakeApi:
             def overseas_balance(self, exchange):

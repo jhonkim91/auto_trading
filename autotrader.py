@@ -1031,9 +1031,11 @@ class CompositeStrategy:
 #  리스크 관리
 # ===================================================================== #
 class RiskManager:
-    def __init__(self, cfg, state_path=None):
+    def __init__(self, cfg, state_path=None, state_store=None, mode=None):
         self.cfg = cfg or {}
         self.state_path = state_path
+        self.state_store = state_store
+        self.mode = mode
         self.state_date = None
         self.day_start = None
         self.peak = None
@@ -1044,11 +1046,21 @@ class RiskManager:
         return datetime.now().strftime("%Y-%m-%d")
 
     def _load_state(self):
-        if not self.state_path or not os.path.exists(self.state_path):
+        data = None
+        if self.state_store and self.mode:
+            try:
+                data = self.state_store.load_equity_state(self.mode)
+            except Exception:  # noqa
+                data = None
+        if not data and self.state_path and os.path.exists(self.state_path):
+            try:
+                with open(self.state_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:  # noqa
+                data = None
+        if not data:
             return
         try:
-            with open(self.state_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
             self.state_date = data.get("date")
             self.day_start = data.get("day_start_equity")
             self.peak = data.get("peak_equity")
@@ -1060,16 +1072,24 @@ class RiskManager:
             self.halted = False
 
     def _save_state(self):
-        if not self.state_path:
-            return
-        os.makedirs(os.path.dirname(self.state_path), exist_ok=True)
-        with open(self.state_path, "w", encoding="utf-8") as f:
-            json.dump({
-                "date": self.state_date,
-                "day_start_equity": self.day_start,
-                "peak_equity": self.peak,
-                "halted": self.halted,
-            }, f, ensure_ascii=False, indent=2)
+        data = {
+            "date": self.state_date,
+            "day_start_equity": self.day_start,
+            "peak_equity": self.peak,
+            "halted": self.halted,
+        }
+        if self.state_store and self.mode and self.state_date:
+            self.state_store.save_equity_state(
+                self.state_date,
+                self.mode,
+                self.day_start,
+                self.peak,
+                self.halted,
+            )
+        if self.state_path:
+            os.makedirs(os.path.dirname(self.state_path), exist_ok=True)
+            with open(self.state_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
 
     def position_size(self, cash, price, candles=None):
         if price <= 0 or cash <= 0:
@@ -1170,6 +1190,15 @@ class TradeJournal:
                     price REAL, amount REAL, reason TEXT,
                     pnl REAL, ok INTEGER, msg TEXT)
             """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS equity_state(
+                    date TEXT,
+                    mode TEXT,
+                    day_start REAL,
+                    peak REAL,
+                    halted INTEGER,
+                    PRIMARY KEY(date, mode))
+            """)
 
     def log(self, mode, market, code, name, side, qty, price, reason="", pnl=None, ok=True, msg=""):
         now = datetime.now()
@@ -1266,6 +1295,49 @@ class TradeJournal:
             pass
         return out
 
+    def save_equity_state(self, date, mode, day_start, peak, halted):
+        """일일 손실/MDD 상태를 모드별로 저장한다."""
+        try:
+            with self.lock, self._conn() as c:
+                c.execute(
+                    """
+                    INSERT INTO equity_state(date, mode, day_start, peak, halted)
+                    VALUES(?,?,?,?,?)
+                    ON CONFLICT(date, mode) DO UPDATE SET
+                        day_start=excluded.day_start,
+                        peak=excluded.peak,
+                        halted=excluded.halted
+                    """,
+                    (date, mode, day_start, peak, 1 if halted else 0),
+                )
+        except Exception as e:  # noqa
+            log.warning("리스크 상태 저장 실패: %s", e)
+
+    def load_equity_state(self, mode, date=None):
+        """지정 모드의 최신 또는 지정일 리스크 상태를 반환한다."""
+        try:
+            with self.lock, self._conn() as c:
+                if date:
+                    row = c.execute(
+                        "SELECT * FROM equity_state WHERE mode=? AND date=?",
+                        (mode, date),
+                    ).fetchone()
+                else:
+                    row = c.execute(
+                        "SELECT * FROM equity_state WHERE mode=? ORDER BY date DESC LIMIT 1",
+                        (mode,),
+                    ).fetchone()
+            if not row:
+                return None
+            return {
+                "date": row["date"],
+                "day_start_equity": row["day_start"],
+                "peak_equity": row["peak"],
+                "halted": bool(row["halted"]),
+            }
+        except Exception:  # noqa
+            return None
+
 
 def today_str():
     return datetime.now().strftime("%Y-%m-%d")
@@ -1285,8 +1357,13 @@ class Trader:
         self.strategy = CompositeStrategy(s.strategy)
         self.strategy_domestic = CompositeStrategy(getattr(s, "strategy_domestic", None) or s.strategy)
         self.strategy_overseas = CompositeStrategy(getattr(s, "strategy_overseas", None) or s.strategy)
-        self.risk = RiskManager(s.risk, state_path=risk_state_path(s.mode))
         self.journal = journal or TradeJournal()
+        self.risk = RiskManager(
+            s.risk,
+            state_path=risk_state_path(s.mode),
+            state_store=self.journal,
+            mode=s.mode,
+        )
         self.notify = notify or (lambda m: None)
         self.auto_enabled = s.engine.get("auto_trade_enabled", True)
         self.running = False

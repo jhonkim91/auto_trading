@@ -112,6 +112,18 @@ class TradeJournal:
                         pnl REAL, ok INTEGER, msg TEXT)
                     """
                 )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS equity_state(
+                        date TEXT,
+                        mode TEXT,
+                        day_start REAL,
+                        peak REAL,
+                        halted INTEGER,
+                        PRIMARY KEY(date, mode)
+                    )
+                    """
+                )
                 conn.commit()
         finally:
             conn.close()
@@ -181,6 +193,53 @@ class TradeJournal:
             "win_rate": (len(wins) / len(pnls) * 100) if pnls else 0.0,
         }
 
+    def save_equity_state(self, date, mode, day_start, peak, halted):
+        """일일 손실/MDD 상태를 모드별로 저장한다."""
+        conn = sqlite3.connect(self.path)
+        try:
+            with self.lock:
+                conn.execute(
+                    """
+                    INSERT INTO equity_state(date, mode, day_start, peak, halted)
+                    VALUES(?,?,?,?,?)
+                    ON CONFLICT(date, mode) DO UPDATE SET
+                        day_start=excluded.day_start,
+                        peak=excluded.peak,
+                        halted=excluded.halted
+                    """,
+                    (date, mode, day_start, peak, 1 if halted else 0),
+                )
+                conn.commit()
+        finally:
+            conn.close()
+
+    def load_equity_state(self, mode, date=None):
+        """지정 모드의 최신 또는 지정일 리스크 상태를 반환한다."""
+        conn = sqlite3.connect(self.path)
+        try:
+            conn.row_factory = sqlite3.Row
+            with self.lock:
+                if date:
+                    row = conn.execute(
+                        "SELECT * FROM equity_state WHERE mode=? AND date=?",
+                        (mode, date),
+                    ).fetchone()
+                else:
+                    row = conn.execute(
+                        "SELECT * FROM equity_state WHERE mode=? ORDER BY date DESC LIMIT 1",
+                        (mode,),
+                    ).fetchone()
+        finally:
+            conn.close()
+        if not row:
+            return None
+        return {
+            "date": row["date"],
+            "day_start_equity": row["day_start"],
+            "peak_equity": row["peak"],
+            "halted": bool(row["halted"]),
+        }
+
 
 class Trader:
     def __init__(self, settings, notify=None):
@@ -189,8 +248,13 @@ class Trader:
         self.strategy = CompositeStrategy(settings.strategy)
         self.strategy_domestic = CompositeStrategy(getattr(settings, "strategy_domestic", None) or settings.strategy)
         self.strategy_overseas = CompositeStrategy(getattr(settings, "strategy_overseas", None) or settings.strategy)
-        self.risk = RiskManager(settings.risk, state_path=risk_state_path(settings.mode))
         self.journal = TradeJournal()
+        self.risk = RiskManager(
+            settings.risk,
+            state_path=risk_state_path(settings.mode),
+            state_store=self.journal,
+            mode=settings.mode,
+        )
         self.notify = notify or (lambda msg: None)  # 알림 콜백
         self.auto_enabled = settings.engine.get("auto_trade_enabled", True)
         self.running = False
