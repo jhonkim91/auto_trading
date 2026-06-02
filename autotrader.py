@@ -101,6 +101,7 @@ DEFAULT_CONFIG = {
     "strategy": {
         "buy_threshold": 3,
         "sell_threshold": 2,
+        "confirm_threshold": 1,
         "indicators": {
             "ma_cross": {"enabled": True, "short": 5, "long": 20, "weight": 1},
             "rsi": {"enabled": True, "period": 14, "low": 30, "high": 70, "weight": 1},
@@ -911,120 +912,16 @@ def _adx(candles, n=14):
 # ===================================================================== #
 #  종합 시그널 전략
 # ===================================================================== #
-@dataclass
-class Signal:
-    action: str
-    score_buy: float
-    score_sell: float
-    reasons: list
-    price: float
-    adx: float = 0.0          # 추세 강도(0~100)
-    trend_ok: bool = True     # 장기추세(레짐) 통과 여부
-    vol_target: float = 0.0    # 변동성 돌파 목표가
+from src.strategy import CompositeStrategy as _ModuleCompositeStrategy
+from src.strategy import Signal
 
 
-class CompositeStrategy:
-    def __init__(self, cfg):
-        self.cfg = cfg or {}
-        self.ind = self.cfg.get("indicators", {})
-        self.buy_th = self.cfg.get("buy_threshold", 2)
-        self.sell_th = self.cfg.get("sell_threshold", 2)
+class CompositeStrategy(_ModuleCompositeStrategy):
+    """GUI 경로의 기존 `price=` 호출을 src.strategy 기준 구현에 연결한다."""
 
-    def evaluate(self, candles, price=None, current_open=None):
-        if not candles or len(candles) < 30:
-            return Signal("hold", 0, 0, ["데이터 부족"], price or 0)
-        closes = [c["close"] for c in candles]
-        p = float(price if price else closes[-1])
-        buy = sell = 0.0
-        reasons = []
-        adx_val = _adx(candles, (self.ind.get("adx", {}) or {}).get("period", 14))
-        trend_ok = True
-        vol_target = 0.0
-
-        c = self.ind.get("ma_cross", {})
-        if c.get("enabled"):
-            w = c.get("weight", 1)
-            s_now, s_prev = _sma(closes, c.get("short", 5)), _sma(closes[:-1], c.get("short", 5))
-            l_now, l_prev = _sma(closes, c.get("long", 20)), _sma(closes[:-1], c.get("long", 20))
-            if None not in (s_now, s_prev, l_now, l_prev):
-                if s_prev <= l_prev and s_now > l_now:
-                    buy += w; reasons.append(f"골든크로스 +{w}")
-                elif s_prev >= l_prev and s_now < l_now:
-                    sell += w; reasons.append(f"데드크로스 +{w}")
-
-        c = self.ind.get("rsi", {})
-        if c.get("enabled"):
-            w = c.get("weight", 1)
-            r = _rsi(closes, c.get("period", 14))
-            if r is not None:
-                if r < c.get("low", 30):
-                    buy += w; reasons.append(f"RSI 과매도({r:.0f}) +{w}")
-                elif r > c.get("high", 70):
-                    sell += w; reasons.append(f"RSI 과매수({r:.0f}) +{w}")
-
-        c = self.ind.get("macd", {})
-        if c.get("enabled"):
-            w = c.get("weight", 1)
-            ml, sl = _macd(closes, c.get("fast", 12), c.get("slow", 26), c.get("signal", 9))
-            if ml and sl and len(ml) >= 2:
-                if ml[-2] <= sl[-2] and ml[-1] > sl[-1]:
-                    buy += w; reasons.append(f"MACD 골든 +{w}")
-                elif ml[-2] >= sl[-2] and ml[-1] < sl[-1]:
-                    sell += w; reasons.append(f"MACD 데드 +{w}")
-
-        c = self.ind.get("bollinger", {})
-        if c.get("enabled"):
-            w = c.get("weight", 1)
-            up, mid, lo = _bollinger(closes, c.get("period", 20), c.get("num_std", 2.0))
-            if up is not None:
-                if p < lo:
-                    buy += w; reasons.append(f"볼린저 하단이탈 +{w}")
-                elif p > up:
-                    sell += w; reasons.append(f"볼린저 상단돌파 +{w}")
-
-        c = self.ind.get("vol_breakout", {})
-        if c.get("enabled"):
-            w = c.get("weight", 2)
-            vol_target = _vol_breakout_target(candles, c.get("k", 0.5), current_open=current_open) or 0.0
-            if vol_target and p >= vol_target > 0:
-                buy += w; reasons.append(f"변동성돌파({vol_target:.2f}) +{w}")
-
-        # N일 신고가 돌파 (레퍼런스: new_high_breakout)
-        c = self.ind.get("new_high", {})
-        if c.get("enabled"):
-            w = c.get("weight", 1)
-            period = c.get("period", 60)
-            hh = _highest_high(candles[:-1], period)
-            if hh and p >= hh:
-                buy += w; reasons.append(f"{period}일 신고가 돌파 +{w}")
-
-        # ADX 추세강도 확인: 추세가 약하면 매수 점수 차감(휩쏘 방지)
-        c = self.ind.get("adx", {})
-        if c.get("enabled"):
-            thr = c.get("min", 20)
-            if adx_val is not None and adx_val < thr:
-                buy = max(0.0, buy - c.get("penalty", 1))
-                reasons.append(f"추세약함(ADX {adx_val:.0f}<{thr})")
-
-        # 판정
-        if buy >= self.buy_th and buy > sell:
-            act = "buy"
-        elif sell >= self.sell_th and sell > buy:
-            act = "sell"
-        else:
-            act = "hold"
-
-        # 추세 필터(레짐): 장기 이평 아래면 신규 매수 보류 (하락장 매수 방지)
-        rc = self.ind.get("regime", {})
-        if rc.get("enabled"):
-            ma_p = rc.get("ma", 60)
-            lma = _sma(closes, ma_p) if len(closes) >= ma_p else None
-            if lma is not None and p < lma:
-                trend_ok = False
-                if act == "buy":
-                    act = "hold"
-                    reasons.append(f"추세필터: 가격<{ma_p}일선 매수보류")
-        return Signal(act, buy, sell, reasons, p, adx=adx_val or 0.0, trend_ok=trend_ok, vol_target=vol_target)
+    def evaluate(self, candles, price=None, current_open=None, current_price=None):
+        selected_price = current_price if current_price is not None else price
+        return super().evaluate(candles, current_price=selected_price, current_open=current_open)
 
 
 # ===================================================================== #

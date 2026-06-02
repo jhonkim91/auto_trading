@@ -30,6 +30,7 @@ _DEFAULT_CONFIG = {
     "strategy": {
         "buy_threshold": 3,
         "sell_threshold": 2,
+        "confirm_threshold": 1,
         "indicators": {},
     },
     "strategy_domestic": {},

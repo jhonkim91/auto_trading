@@ -24,6 +24,7 @@ class StrategyTests(unittest.TestCase):
             {
                 "buy_threshold": 1,
                 "sell_threshold": 2,
+                "confirm_threshold": 0,
                 "indicators": {"vol_breakout": {"enabled": True, "k": 0.5, "weight": 1}},
             }
         )
@@ -38,6 +39,7 @@ class StrategyTests(unittest.TestCase):
             {
                 "buy_threshold": 1,
                 "sell_threshold": 2,
+                "confirm_threshold": 0,
                 "indicators": {"vol_breakout": {"enabled": True, "k": 0.5, "weight": 1}},
             }
         )

@@ -49,6 +49,7 @@ strategy:
   # 지표 최대 가중치 합: 매수 7(이평1+RSI1+MACD1+볼린저1+돌파2+신고가1), 매도 4
   buy_threshold: 3               # 매수: 변동성돌파(2) 단독 불가 → 2개 이상 지표 동의 필요
   sell_threshold: 2              # 매도: 빠른 청산 위해 2 유지 (손절/트레일링/익절은 별도)
+  confirm_threshold: 1           # 1차 트리거 이후 보조 확인 최솟값
   indicators:
     ma_cross:    { enabled: true,  short: 5,  long: 20,  weight: 1 }
     rsi:         { enabled: true,  period: 14, low: 30, high: 70, weight: 1 }
