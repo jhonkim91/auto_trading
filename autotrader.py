@@ -23,6 +23,7 @@ import logging
 import threading
 import urllib.request
 import urllib.parse
+import concurrent.futures
 from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -74,6 +75,7 @@ DEFAULT_CONFIG = {
     },
     "engine": {
         "loop_interval_sec": 60,
+        "process_timeout_sec": 30,
         "domestic_session": "09:00-15:20",
         "overseas_session": "23:30-06:00",
         "auto_trade_enabled": True,
@@ -207,6 +209,17 @@ def _split_account(raw):
     return raw, "01"
 
 
+def _deep_merge(base, override):
+    """기본 설정에 사용자 설정을 재귀 병합한다."""
+    merged = json.loads(json.dumps(base))
+    for key, value in (override or {}).items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
 def load_settings():
     if load_dotenv:
         load_dotenv(ENV_PATH, override=True)
@@ -232,7 +245,7 @@ def load_settings():
         try:
             with open(CFG_PATH, "r", encoding="utf-8") as f:
                 ycfg = yaml.safe_load(f) or {}
-            cfg.update(ycfg)
+            cfg = _deep_merge(cfg, ycfg)
         except Exception as e:  # noqa
             log.warning("config.yaml 파싱 실패, 기본값 사용: %s", e)
 
@@ -1443,6 +1456,19 @@ class Trader:
         """대시보드/리포트 표시용 국내+미국 잔고 스냅샷을 반환한다."""
         return build_portfolio_snapshot(self.safe_balance(), self.safe_overseas_balance())
 
+    def _process_with_timeout(self, label, target, timeout, *args):
+        """종목 하나가 지연돼도 전체 스캔이 계속되도록 처리 시간을 제한한다."""
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(target, *args)
+        try:
+            future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            log.warning("%s 처리 타임아웃(%ds) — 다음 종목으로 진행", label, timeout)
+        except Exception as e:  # noqa
+            log.exception("%s 처리 오류: %s", label, e)
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
     def scan_once(self):
         # 이미 다른 스캔이 진행 중이면 건너뜀(유량 초과 방지)
         if not self._scan_lock.acquire(blocking=False):
@@ -1458,6 +1484,7 @@ class Trader:
                 return
             dom_open = self._dom_open()
             ovs_open = self._ovs_open()
+            timeout = int((self.s.engine or {}).get("process_timeout_sec", 30) or 30)
 
             # 국내장: 열려 있거나, 둘 다 닫혀 있으면 기본 분석용으로 국내 스캔
             if dom_open or not ovs_open:
@@ -1466,7 +1493,7 @@ class Trader:
                     if p["code"] not in codes:
                         codes.append(p["code"])
                 for code in codes:
-                    self._proc_dom(code, bal)
+                    self._process_with_timeout(f"국내 {code}", self._proc_dom, timeout, code, bal)
 
             # 미국장: 열려 있으면 미국 종목 발굴(USD 기준)
             if ovs_open:
@@ -1482,7 +1509,7 @@ class Trader:
                         items.append({"symbol": p["code"],
                                       "exchange": (self.s.screener or {}).get("overseas_market", "NAS")})
                 for it in items:
-                    self._proc_ovs(it, obal)
+                    self._process_with_timeout(f"해외 {it.get('symbol', '')}", self._proc_ovs, timeout, it, obal)
         finally:
             self._scan_lock.release()
 
@@ -1786,10 +1813,14 @@ class TelegramController:
         import asyncio
         try:
             if self._loop and self.app.running:
-                asyncio.run_coroutine_threadsafe(self.app.stop(), self._loop)
+                future = asyncio.run_coroutine_threadsafe(self.app.stop(), self._loop)
+                future.result(timeout=5.0)
         except Exception:  # noqa
-            pass
+            log.warning("봇 stop 대기 중 오류", exc_info=True)
+        if self._thread and self._thread.is_alive() and self._thread is not threading.current_thread():
+            self._thread.join(timeout=5.0)
         self._loop = None
+        self._thread = None
 
 
 # ===================================================================== #

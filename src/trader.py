@@ -3,6 +3,7 @@
 텔레그램 봇과 분리(notify 콜백으로 알림). 국내/해외 종목 모두 처리.
 auto_trade_enabled=False 면 주문 없이 시그널 알림만(반자동).
 """
+import concurrent.futures
 import os
 import threading
 import time
@@ -100,6 +101,8 @@ class Trader:
         self._stop_evt = threading.Event()
         self.last_signals = {}
         self._peak = {}
+        self._cooldown = {}
+        self.last_candidates = []
 
     # ----------------------------------------------------------------- #
     #  종목 유니버스
@@ -109,6 +112,16 @@ class Trader:
 
     def _overseas_items(self):
         return self.s.universe.get("overseas", []) or []
+
+    @property
+    def domestic_count(self) -> int:
+        """텔레그램/GUI 표시용 국내 감시 종목 수."""
+        return len(self._domestic_codes())
+
+    @property
+    def overseas_count(self) -> int:
+        """텔레그램/GUI 표시용 해외 감시 종목 수."""
+        return len(self._overseas_items())
 
     def _overseas_exchanges(self):
         """설정된 해외 종목의 거래소 목록을 중복 없이 반환한다."""
@@ -124,6 +137,71 @@ class Trader:
 
     def _peak_key(self, market: str, code: str, exchange: str = "") -> str:
         return f"{market}:{exchange}:{code}" if exchange else f"{market}:{code}"
+
+    def _in_cooldown(self, key: str) -> bool:
+        """청산 후 같은 종목 재매수 금지 시간이 남아 있는지 확인한다."""
+        minutes = (getattr(self.s, "risk", {}) or {}).get("cooldown_min", 0)
+        if not minutes:
+            return False
+        timestamp = getattr(self, "_cooldown", {}).get(key)
+        return timestamp is not None and (time.time() - timestamp) < minutes * 60
+
+    def screen_candidates(self, cash: float = 0) -> list:
+        """스크리너가 켜져 있으면 거래량 순위 후보를, 아니면 고정 국내 universe를 반환한다."""
+        screener = getattr(self.s, "screener", {}) or {}
+        if not screener.get("enabled"):
+            return [{"code": code, "name": code} for code in self._domestic_codes()]
+        try:
+            pool = self.api.domestic_volume_rank(
+                screener.get("market", "all"),
+                screener.get("pool_size", 30),
+            )
+        except Exception as e:  # noqa
+            log.warning("국내 스크리너 조회 실패, 고정 universe 사용: %s", e)
+            return [{"code": code, "name": code} for code in self._domestic_codes()]
+
+        min_price = screener.get("min_price", 0)
+        max_price = screener.get("max_price", 10 ** 12)
+        pool = [item for item in pool if min_price <= _to_float(item.get("price")) <= max_price]
+        if cash and cash > 0:
+            pool = [item for item in pool if _to_float(item.get("price")) * 1.005 <= cash]
+        if screener.get("momentum_rank", True):
+            pool.sort(key=lambda item: _to_float(item.get("change_rate")), reverse=True)
+        self.last_candidates = pool[: screener.get("top_k", 15)]
+        return self.last_candidates
+
+    def screen_overseas(self, cash: float = 0) -> list:
+        """스크리너가 켜져 있으면 미국 후보를, 아니면 고정 해외 universe를 반환한다."""
+        screener = getattr(self.s, "screener", {}) or {}
+        if not screener.get("enabled"):
+            return self._overseas_items()
+
+        exchange = screener.get("overseas_market", "NAS")
+        min_price = screener.get("overseas_min_price", 0)
+        max_price = screener.get("overseas_max_price", 10 ** 9)
+        top_k = screener.get("top_k", 15)
+        try:
+            pool = self.api.overseas_search(
+                exchange,
+                min_price,
+                max_price,
+                screener.get("pool_size", 30),
+            )
+        except Exception as e:  # noqa
+            log.warning("미국 스크리너 조회 실패, 후보풀 사용: %s", e)
+            pool = []
+
+        if not pool:
+            symbols = screener.get("overseas_pool", [])
+            return [{"symbol": symbol, "exchange": exchange} for symbol in symbols[:top_k]]
+
+        pool = [item for item in pool if min_price <= _to_float(item.get("price")) <= max_price]
+        if cash and cash > 0:
+            pool = [item for item in pool if _to_float(item.get("price")) * 1.005 <= cash]
+        if screener.get("momentum_rank", True):
+            pool.sort(key=lambda item: _to_float(item.get("change_rate")), reverse=True)
+        self.last_candidates = pool[:top_k]
+        return [{"symbol": item["code"], "exchange": exchange} for item in pool[:top_k]]
 
     def _overseas_buy_quantity(self, symbol: str, exchange: str, price: float, candles: list, balance: dict) -> int:
         """해외 매수가능금액과 리스크 한도를 함께 반영해 매수 수량을 계산한다."""
@@ -176,15 +254,17 @@ class Trader:
                         self._report_order("매도", code, pos["qty"], quote["price"], why, res)
                         if res.get("ok"):
                             self._peak.pop(key, None)
+                            self._cooldown[key] = time.time()
                     else:
                         self.notify(f"📉 [신호] {code} 매도 추천 ({why}) — 자동매매 OFF")
                     return
 
             # 신규 매수
             if sig.action == "buy" and not pos:
+                if self._in_cooldown(self._peak_key("domestic", code)):
+                    return
                 if not self.risk.can_open_new(len(balance["positions"])):
                     return
-                equity = balance.get("total_eval") or balance.get("cash", 0)
                 qty = self.risk.position_size(balance.get("cash", 0), quote["price"], candles)
                 if qty < 1:
                     return
@@ -234,11 +314,14 @@ class Trader:
                         self._report_order("매도(美)", symbol, pos["qty"], quote["price"], why, res)
                         if res.get("ok"):
                             self._peak.pop(key, None)
+                            self._cooldown[key] = time.time()
                     else:
                         self.notify(f"📉 [신호] {symbol} 매도 추천 ({why}) — 자동매매 OFF")
                     return
 
             if sig.action == "buy" and not pos:
+                if self._in_cooldown(self._peak_key("overseas", symbol, exch)):
+                    return
                 if not self.risk.can_open_new(len(balance["positions"])):
                     return
                 qty = self._overseas_buy_quantity(symbol, exch, quote["price"], candles, balance)
@@ -264,6 +347,19 @@ class Trader:
         self.notify(msg)
         log.info(msg.replace("\n", " | "))
 
+    def _process_with_timeout(self, label: str, target, timeout: int, *args):
+        """종목 하나가 지연돼도 전체 스캔이 계속되도록 처리 시간을 제한한다."""
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(target, *args)
+        try:
+            future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            log.warning("%s 처리 타임아웃(%ds) — 다음 종목으로 진행", label, timeout)
+        except Exception as e:  # noqa
+            log.exception("%s 처리 오류: %s", label, e)
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
     # ----------------------------------------------------------------- #
     #  1회 스캔
     # ----------------------------------------------------------------- #
@@ -282,13 +378,19 @@ class Trader:
         if self.risk.halted:
             return
 
-        for code in self._domestic_codes():
-            self._process_domestic(code, balance)
+        timeout = int((getattr(self.s, "engine", {}) or {}).get("process_timeout_sec", 30) or 30)
+        for candidate in self.screen_candidates(balance.get("cash", 0)):
+            code = candidate["code"]
+            self._process_with_timeout(f"국내 {code}", self._process_domestic, timeout, code, balance)
 
-        overseas_items = self._overseas_items()
-        overseas_balance = self.safe_overseas_balance() if overseas_items else {"cash": 0, "total_eval": 0, "positions": []}
+        screener = getattr(self.s, "screener", {}) or {}
+        should_scan_overseas = bool(self._overseas_items()) or bool(screener.get("enabled"))
+        overseas_balance = self.safe_overseas_balance() if should_scan_overseas else {"cash": 0, "total_eval": 0, "positions": []}
+        overseas_cash = 0 if screener.get("overseas_use_buyable", True) else overseas_balance.get("cash", 0)
+        overseas_items = self.screen_overseas(overseas_cash) if should_scan_overseas else []
         for item in overseas_items:
-            self._process_overseas(item, overseas_balance)
+            symbol = item.get("symbol", "")
+            self._process_with_timeout(f"해외 {symbol}", self._process_overseas, timeout, item, overseas_balance)
 
     def safe_domestic_balance(self):
         try:

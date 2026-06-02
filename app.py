@@ -415,14 +415,14 @@ class TradingApp:
         t = self._ensure_trader()
         if self.bot and self.bot.is_running:
             self.bot.stop()
+            self.bot = None
             self.btn_bot.config(text="🤖 봇 시작", bg=PANEL)
             self._log("텔레그램 봇 중지")
         else:
             from src.telegram_bot import TelegramController
-            if self.bot is None:
-                self.bot = TelegramController(self.settings, t)
-                # 알림이 GUI와 텔레그램 양쪽으로 가도록 결합
-                t.notify = self._notify
+            self.bot = TelegramController(self.settings, t)
+            # 알림이 GUI와 텔레그램 양쪽으로 가도록 결합
+            t.notify = self._notify
             self.bot.start_in_thread()
             self.btn_bot.config(text="🤖 봇 중지", bg=GREEN)
             self._log("텔레그램 봇 시작")

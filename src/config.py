@@ -18,6 +18,7 @@ PAPER_WS_URL = "ws://ops.koreainvestment.com:31000"
 _DEFAULT_CONFIG = {
     "engine": {
         "loop_interval_sec": 60,
+        "process_timeout_sec": 30,
         "domestic_session": "09:00-15:20",
         "overseas_session": "23:30-06:00",
         "auto_trade_enabled": True,

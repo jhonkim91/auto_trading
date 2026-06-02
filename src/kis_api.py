@@ -309,6 +309,39 @@ class KISApi:
             "positions": positions,
         }
 
+    def domestic_volume_rank(self, market: str = "all", count: int = 30) -> list:
+        """국내 거래량 순위 조회. 스크리너 후보 [{code,name,price,change_rate,volume}] 반환."""
+        market_code = {"all": "0000", "kospi": "0001", "kosdaq": "1001"}.get(market, "0000")
+        params = {
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_COND_SCR_DIV_CODE": "20171",
+            "FID_INPUT_ISCD": market_code,
+            "FID_DIV_CLS_CODE": "0",
+            "FID_BLNG_CLS_CODE": "0",
+            "FID_TRGT_CLS_CODE": "111111111",
+            "FID_TRGT_EXLS_CLS_CODE": "0000000000",
+            "FID_INPUT_PRICE_1": "",
+            "FID_INPUT_PRICE_2": "",
+            "FID_VOL_CNT": "",
+            "FID_INPUT_DATE_1": "",
+        }
+        data = self._get("/uapi/domestic-stock/v1/quotations/volume-rank", "FHPST01710000", params)
+        candidates = []
+        for row in (data.get("output") or [])[:count]:
+            code = row.get("mksc_shrn_iscd")
+            if not code:
+                continue
+            candidates.append(
+                {
+                    "code": code,
+                    "name": row.get("hts_kor_isnm", code),
+                    "price": float(row.get("stck_prpr", 0) or 0),
+                    "change_rate": float(row.get("prdy_ctrt", 0) or 0),
+                    "volume": int(float(row.get("acml_vol", 0) or 0)),
+                }
+            )
+        return candidates
+
     # ------------------------------------------------------------------ #
     #  해외주식(미국) 시세 / 주문 / 잔고
     # ------------------------------------------------------------------ #
@@ -384,6 +417,53 @@ class KISApi:
             )
         )
         return {"amount": amount, "qty": qty}
+
+    def overseas_search(self, exchange: str = "NAS", min_price: float = 0, max_price: float = 0, count: int = 30) -> list:
+        """미국 조건검색 조회. 스크리너 후보 [{code,name,price,change_rate}] 반환."""
+        params = {
+            "AUTH": "",
+            "EXCD": self._EXCD.get(exchange, "NAS"),
+            "CO_YN_PRICECUR": "1" if (min_price or max_price) else "0",
+            "CO_ST_PRICECUR": str(min_price or ""),
+            "CO_EN_PRICECUR": str(max_price or ""),
+            "CO_YN_RATE": "0",
+            "CO_ST_RATE": "",
+            "CO_EN_RATE": "",
+            "CO_YN_VALX": "0",
+            "CO_ST_VALX": "",
+            "CO_EN_VALX": "",
+            "CO_YN_SHAR": "0",
+            "CO_ST_SHAR": "",
+            "CO_EN_SHAR": "",
+            "CO_YN_VOLUME": "0",
+            "CO_ST_VOLUME": "",
+            "CO_EN_VOLUME": "",
+            "CO_YN_AMT": "0",
+            "CO_ST_AMT": "",
+            "CO_EN_AMT": "",
+            "CO_YN_EPS": "0",
+            "CO_ST_EPS": "",
+            "CO_EN_EPS": "",
+            "CO_YN_PER": "0",
+            "CO_ST_PER": "",
+            "CO_EN_PER": "",
+            "KEYB": "",
+        }
+        data = self._get("/uapi/overseas-price/v1/quotations/inquire-search", "HHDFS76410000", params)
+        candidates = []
+        for row in (data.get("output2") or [])[:count]:
+            symbol = row.get("symb")
+            if not symbol:
+                continue
+            candidates.append(
+                {
+                    "code": symbol,
+                    "name": row.get("name") or row.get("knam") or symbol,
+                    "price": float(row.get("last", 0) or 0),
+                    "change_rate": float(row.get("rate", 0) or 0),
+                }
+            )
+        return candidates
 
     def overseas_order(self, symbol: str, qty: int, side: str,
                        price: float = 0, exchange: str = "NAS") -> dict:

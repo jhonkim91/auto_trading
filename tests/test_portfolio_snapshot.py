@@ -11,6 +11,7 @@ from autotrader import RiskManager as GuiRiskManager
 from autotrader import TradeJournal
 from autotrader import build_portfolio_snapshot as build_gui_snapshot
 from autotrader import _format_balance_lines
+from autotrader import _deep_merge
 from src.config import Settings as ModuleSettings
 from src.kis_api import KISApi
 from src.kis_api import KIS_INTERVAL_PAPER, KIS_INTERVAL_REAL, KIS_RATE_PAPER, KIS_RATE_REAL
@@ -90,6 +91,15 @@ class PortfolioSnapshotTests(unittest.TestCase):
         )
         self.assertEqual(gui_paper.active_account_key, "KIS_PAPER_ACCOUNT")
         self.assertEqual(module_real.active_account_key, "KIS_REAL_ACCOUNT")
+
+    def test_gui_config_deep_merge_preserves_nested_defaults(self):
+        merged = _deep_merge(
+            {"strategy": {"buy_threshold": 3, "indicators": {"rsi": {"enabled": True}}}},
+            {"strategy": {"buy_threshold": 4}},
+        )
+
+        self.assertEqual(merged["strategy"]["buy_threshold"], 4)
+        self.assertEqual(merged["strategy"]["indicators"]["rsi"]["enabled"], True)
 
     def test_trade_journal_filters_records_by_mode(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -247,6 +257,157 @@ class PortfolioSnapshotTests(unittest.TestCase):
         self.assertEqual(calls[0][0], "/uapi/overseas-stock/v1/trading/inquire-psamount")
         self.assertEqual(calls[0][1], "VTTS3007R")
         self.assertEqual(calls[0][2]["ITEM_CD"], "QQQ")
+
+    def test_kis_domestic_volume_rank_parses_candidates(self):
+        calls = []
+        api = KISApi.__new__(KISApi)
+
+        def fake_get(path, tr_id, params):
+            calls.append((path, tr_id, params))
+            return {
+                "output": [
+                    {
+                        "mksc_shrn_iscd": "005930",
+                        "hts_kor_isnm": "삼성전자",
+                        "stck_prpr": "75000",
+                        "prdy_ctrt": "1.5",
+                        "acml_vol": "1000000",
+                    }
+                ]
+            }
+
+        api._get = fake_get
+
+        result = api.domestic_volume_rank("kospi", 10)
+
+        self.assertEqual(result[0]["code"], "005930")
+        self.assertEqual(result[0]["price"], 75000)
+        self.assertEqual(calls[0][0], "/uapi/domestic-stock/v1/quotations/volume-rank")
+        self.assertEqual(calls[0][1], "FHPST01710000")
+        self.assertEqual(calls[0][2]["FID_INPUT_ISCD"], "0001")
+
+    def test_kis_overseas_search_parses_candidates(self):
+        calls = []
+        api = KISApi.__new__(KISApi)
+
+        def fake_get(path, tr_id, params):
+            calls.append((path, tr_id, params))
+            return {"output2": [{"symb": "AAPL", "name": "Apple", "last": "190.5", "rate": "2.1"}]}
+
+        api._get = fake_get
+
+        result = api.overseas_search("NAS", 5, 1000, 30)
+
+        self.assertEqual(result[0]["code"], "AAPL")
+        self.assertEqual(result[0]["price"], 190.5)
+        self.assertEqual(calls[0][0], "/uapi/overseas-price/v1/quotations/inquire-search")
+        self.assertEqual(calls[0][1], "HHDFS76410000")
+        self.assertEqual(calls[0][2]["CO_YN_PRICECUR"], "1")
+
+    def test_trader_screener_filters_and_sorts_domestic_candidates(self):
+        class FakeApi:
+            def domestic_volume_rank(self, market, count):
+                return [
+                    {"code": "LOW", "name": "low", "price": 1000, "change_rate": 100},
+                    {"code": "A", "name": "A", "price": 10000, "change_rate": 1},
+                    {"code": "B", "name": "B", "price": 12000, "change_rate": 5},
+                ]
+
+        trader = Trader.__new__(Trader)
+        trader.s = SimpleNamespace(
+            universe={"domestic": ["005930"], "overseas": []},
+            screener={
+                "enabled": True,
+                "market": "all",
+                "pool_size": 30,
+                "top_k": 2,
+                "min_price": 2000,
+                "max_price": 50000,
+                "momentum_rank": True,
+            },
+        )
+        trader.api = FakeApi()
+
+        result = trader.screen_candidates(cash=20000)
+
+        self.assertEqual([item["code"] for item in result], ["B", "A"])
+
+    def test_trader_screener_falls_back_to_overseas_pool(self):
+        class FakeApi:
+            def overseas_search(self, exchange, min_price, max_price, count):
+                raise RuntimeError("network disabled")
+
+        trader = Trader.__new__(Trader)
+        trader.s = SimpleNamespace(
+            universe={"domestic": [], "overseas": []},
+            screener={
+                "enabled": True,
+                "overseas_market": "NAS",
+                "overseas_pool": ["AAPL", "MSFT", "NVDA"],
+                "top_k": 2,
+            },
+        )
+        trader.api = FakeApi()
+
+        with patch("src.trader.log.warning"):
+            result = trader.screen_overseas()
+
+        self.assertEqual(result, [{"symbol": "AAPL", "exchange": "NAS"}, {"symbol": "MSFT", "exchange": "NAS"}])
+
+    def test_scan_once_uses_screener_candidates(self):
+        processed = []
+        trader = Trader.__new__(Trader)
+        trader.s = SimpleNamespace(universe={"domestic": [], "overseas": []}, screener={"enabled": True})
+        trader.risk = SimpleNamespace(check_limits=lambda equity: "", halted=False)
+        trader.safe_domestic_balance = lambda: {"cash": 100000, "total_eval": 100000, "positions": []}
+        trader.screen_candidates = lambda cash: [{"code": "A"}, {"code": "B"}]
+        trader._process_domestic = lambda code, balance: processed.append(code)
+        trader._overseas_items = lambda: []
+        trader.safe_overseas_balance = lambda: {"cash": 0, "total_eval": 0, "positions": []}
+        trader.screen_overseas = lambda cash=0: []
+
+        trader.scan_once()
+
+        self.assertEqual(processed, ["A", "B"])
+
+    def test_cooldown_blocks_reentry_for_configured_minutes(self):
+        trader = Trader.__new__(Trader)
+        trader.s = SimpleNamespace(risk={"cooldown_min": 30})
+        trader._cooldown = {"domestic:005930": datetime.now().timestamp()}
+
+        self.assertTrue(trader._in_cooldown("domestic:005930"))
+
+    def test_domestic_buy_respects_cooldown_key(self):
+        class FakeApi:
+            def __init__(self):
+                self.orders = []
+
+            def domestic_daily(self, code, count=120):
+                return [{"open": 100, "high": 110, "low": 90, "close": 105, "volume": 1000}] * 40
+
+            def domestic_price(self, code):
+                return {"price": 100, "open": 95}
+
+            def domestic_order(self, code, qty, side, price=0):
+                self.orders.append((code, qty, side, price))
+                return {"ok": True}
+
+        fake_api = FakeApi()
+        trader = Trader.__new__(Trader)
+        trader.s = SimpleNamespace(risk={"cooldown_min": 30})
+        trader.api = fake_api
+        trader.strategy = SimpleNamespace(evaluate=lambda *args, **kwargs: SimpleNamespace(action="buy", reasons=["test"]))
+        trader.risk = SimpleNamespace(can_open_new=lambda current_positions: True,
+                                      position_size=lambda cash, price, candles: 1)
+        trader.auto_enabled = True
+        trader.notify = lambda message: None
+        trader.last_signals = {}
+        trader._peak = {}
+        trader._cooldown = {"domestic:005930": datetime.now().timestamp()}
+
+        trader._process_domestic("005930", {"cash": 100000, "total_eval": 100000, "positions": []})
+
+        self.assertEqual(fake_api.orders, [])
 
     def test_overseas_buy_uses_buyable_quantity_cap(self):
         class FakeApi:

@@ -38,6 +38,7 @@ screener:
 # 매매 엔진
 engine:
   loop_interval_sec: 60          # 시그널 점검 주기(초)
+  process_timeout_sec: 30        # 종목 1개 처리 최대 대기시간(초), 초과 시 다음 종목으로 진행
   domestic_session: "09:00-15:20"  # 국내장 자동매매 시간
   overseas_session: "23:30-06:00"  # 미국장(한국시간, 서머타임 무시 단순값)
   auto_trade_enabled: true       # false 면 시그널 알림만 (반자동)

@@ -10,7 +10,7 @@ python-telegram-bot v20+ (async). 보안: 허용된 chat_id 화이트리스트.
   /signals       - 최근 시그널 요약
   /buy  <코드> <수량> [us <거래소>]  - 수동 매수
   /sell <코드> <수량> [us <거래소>]  - 수동 매도
-  /liquidate     - 국내 전체 청산
+  /liquidate     - 국내/미국 전체 청산
 """
 import asyncio
 import threading
@@ -103,7 +103,7 @@ class TelegramController:
             "/signals - 최근 시그널\n"
             "/buy <코드> <수량> [us NAS] - 수동 매수\n"
             "/sell <코드> <수량> [us NAS] - 수동 매도\n"
-            "/liquidate - 국내 전체 청산\n"
+            "/liquidate - 국내/미국 전체 청산\n"
             f"\n현재 모드: {self.s.mode}"
         )
 
@@ -116,7 +116,7 @@ class TelegramController:
             f"루프 실행중: {'예' if t.running else '아니오'}\n"
             f"자동매매: {'ON' if t.auto_enabled else 'OFF'}\n"
             f"매매중단(한도): {'예' if t.risk.halted else '아니오'}\n"
-            f"감시 국내 {len(t._domestic_codes())}종목 / 해외 {len(t._overseas_items())}종목"
+            f"감시 국내 {t.domestic_count}종목 / 해외 {t.overseas_count}종목"
         )
 
     async def cmd_portfolio(self, update: Update, ctx):
@@ -196,7 +196,7 @@ class TelegramController:
     async def cmd_liquidate(self, update: Update, ctx):
         if not await self._guard(update):
             return
-        await update.message.reply_text("⚠️ 국내 전체 청산 실행...")
+        await update.message.reply_text("⚠️ 국내/미국 전체 청산 실행...")
         results = await asyncio.to_thread(self.trader.liquidate_all)
         if not results:
             await update.message.reply_text("청산할 보유 종목이 없습니다.")
@@ -247,5 +247,12 @@ class TelegramController:
     def stop(self):
         """봇 정지 (이벤트 루프에 종료 요청)."""
         if self._loop and self.app.running:
-            asyncio.run_coroutine_threadsafe(self.app.stop(), self._loop)
+            future = asyncio.run_coroutine_threadsafe(self.app.stop(), self._loop)
+            try:
+                future.result(timeout=5.0)
+            except Exception:  # noqa
+                log.warning("텔레그램 봇 stop 대기 중 오류", exc_info=True)
+        if self._thread and self._thread.is_alive() and self._thread is not threading.current_thread():
+            self._thread.join(timeout=5.0)
         self._loop = None
+        self._thread = None
