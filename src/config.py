@@ -45,6 +45,25 @@ _DEFAULT_CONFIG = {
         "max_drawdown_pct": 15.0,
         "atr_period": 14,
     },
+    "costs": {
+        "risk_free_rate": 0.025,
+        "commission_pct": 0.015,
+        "exchange_fee_pct": 0.0036396,
+        "tax_kospi_pct": 0.20,
+        "tax_kosdaq_pct": 0.20,
+        "overseas_commission_pct": 0.025,
+        "min_slippage_bps": 5.0,
+    },
+    "validation": {
+        "min_oos_trades": 30,
+        "psr_min": 0.95,
+        "wfe_min": 0.50,
+        "pbo_max": 0.50,
+        "dsr_min": 0.95,
+        "ror_max": 0.05,
+        "mc_ruin_threshold": 0.30,
+        "mc_simulations": 1000,
+    },
     "universe": {
         "domestic": [],
         "overseas": [],
@@ -67,6 +86,8 @@ class Settings:
     strategy_domestic: dict = field(default_factory=dict)
     strategy_overseas: dict = field(default_factory=dict)
     risk: dict = field(default_factory=dict)
+    costs: dict = field(default_factory=dict)
+    validation: dict = field(default_factory=dict)
     engine: dict = field(default_factory=dict)
     universe: dict = field(default_factory=dict)
     screener: dict = field(default_factory=dict)
@@ -157,6 +178,8 @@ def load_settings() -> Settings:
         strategy_domestic=strategy_domestic,
         strategy_overseas=strategy_overseas,
         risk=cfg.get("risk", {}),
+        costs=cfg.get("costs", {}),
+        validation=cfg.get("validation", {}),
         engine=cfg.get("engine", {}),
         universe=cfg.get("universe", {}),
         screener=cfg.get("screener", {}),

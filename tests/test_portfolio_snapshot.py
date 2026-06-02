@@ -16,6 +16,8 @@ from autotrader import build_portfolio_snapshot as build_gui_snapshot
 from autotrader import _format_balance_lines
 from autotrader import _deep_merge
 from src.config import Settings as ModuleSettings
+from src.config import _DEFAULT_CONFIG as MODULE_DEFAULT_CONFIG
+from src.config import load_settings as load_module_settings
 from src.kis_api import KISApi
 from src.kis_api import KIS_INTERVAL_PAPER, KIS_INTERVAL_REAL, KIS_RATE_PAPER, KIS_RATE_REAL
 from src.risk import RiskManager
@@ -585,6 +587,24 @@ class PortfolioSnapshotTests(unittest.TestCase):
 
         self.assertEqual(module_settings.strategy_domestic["buy_threshold"], 2)
         self.assertEqual(module_settings.strategy_overseas["buy_threshold"], 4)
+
+    def test_settings_exposes_costs_and_validation(self):
+        from src.config import _DEFAULT_CONFIG
+
+        self.assertIn("costs", _DEFAULT_CONFIG)
+        self.assertIn("validation", _DEFAULT_CONFIG)
+        self.assertEqual(_DEFAULT_CONFIG["costs"]["tax_kospi_pct"], 0.20)
+        self.assertEqual(_DEFAULT_CONFIG["validation"]["min_oos_trades"], 30)
+        self.assertEqual(_DEFAULT_CONFIG["validation"]["psr_min"], 0.95)
+
+    def test_load_settings_exposes_costs_and_validation(self):
+        settings = load_module_settings()
+
+        self.assertEqual(settings.costs["tax_kosdaq_pct"], MODULE_DEFAULT_CONFIG["costs"]["tax_kosdaq_pct"])
+        self.assertEqual(
+            settings.validation["mc_simulations"],
+            MODULE_DEFAULT_CONFIG["validation"]["mc_simulations"],
+        )
 
 
 if __name__ == "__main__":

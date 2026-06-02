@@ -77,3 +77,24 @@ risk:
   daily_loss_limit_pct: 3.0      # 일일 손실 한도(%) 도달 시 당일 매매 중단
   max_drawdown_pct: 15.0         # 누적 MDD 한도(%) 도달 시 전체 청산 알림
   atr_period: 14
+
+# 비용 파라미터 (2026년 기준, 변경 시 이 값을 수정)
+costs:
+  risk_free_rate: 0.025          # 무위험수익률 (한국은행 기준금리 2.5%)
+  commission_pct: 0.015          # 위탁수수료 (%, MTS 기준)
+  exchange_fee_pct: 0.0036396    # 유관기관제비용 (%)
+  tax_kospi_pct: 0.20            # 코스피 실효 거래세 (%, 2026.1.1~)
+  tax_kosdaq_pct: 0.20           # 코스닥 거래세 (%, 2026.1.1~)
+  overseas_commission_pct: 0.025 # 해외주식 위탁수수료 (%)
+  min_slippage_bps: 5.0          # 최소 슬리피지 (basis points, 편도)
+
+# 백테스트 검증 게이트 (go/no-go 기준값)
+validation:
+  min_oos_trades: 30             # OOS 최소 거래수 (미달 시 강제 no-go)
+  psr_min: 0.95                  # Probabilistic Sharpe Ratio 최솟값
+  wfe_min: 0.50                  # Walk-Forward Efficiency 최솟값
+  pbo_max: 0.50                  # Probability of Backtest Overfitting 최댓값
+  dsr_min: 0.95                  # Deflated Sharpe Ratio 최솟값
+  ror_max: 0.05                  # Probability of Ruin 최댓값 (5%)
+  mc_ruin_threshold: 0.30        # 파산 기준 낙폭 (30%)
+  mc_simulations: 1000           # 기본 MC 시뮬 횟수 (--full-validation 시 5000)
