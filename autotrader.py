@@ -112,6 +112,8 @@ DEFAULT_CONFIG = {
             "regime": {"enabled": True, "ma": 60},
         },
     },
+    "strategy_domestic": {},
+    "strategy_overseas": {},
     "risk": {
         "max_positions": 5,
         "risk_per_trade_pct": 1.0,
@@ -162,6 +164,8 @@ class Settings:
     telegram_token: str
     allowed_chat_ids: list
     strategy: dict = field(default_factory=dict)
+    strategy_domestic: dict = field(default_factory=dict)
+    strategy_overseas: dict = field(default_factory=dict)
     risk: dict = field(default_factory=dict)
     engine: dict = field(default_factory=dict)
     universe: dict = field(default_factory=dict)
@@ -249,10 +253,28 @@ def load_settings():
         except Exception as e:  # noqa
             log.warning("config.yaml 파싱 실패, 기본값 사용: %s", e)
 
-    return Settings(mode, ak, sk, no, prod, g("TELEGRAM_BOT_TOKEN"), allowed,
-                    cfg.get("strategy", {}), cfg.get("risk", {}),
-                    cfg.get("engine", {}), cfg.get("universe", {}),
-                    cfg.get("screener", {}), paper_account, real_account)
+    base_strategy = cfg.get("strategy", {})
+    strategy_domestic = _deep_merge(base_strategy, cfg.get("strategy_domestic", {}))
+    strategy_overseas = _deep_merge(base_strategy, cfg.get("strategy_overseas", {}))
+
+    return Settings(
+        mode=mode,
+        app_key=ak,
+        app_secret=sk,
+        account_no=no,
+        account_prod=prod,
+        telegram_token=g("TELEGRAM_BOT_TOKEN"),
+        allowed_chat_ids=allowed,
+        strategy=base_strategy,
+        strategy_domestic=strategy_domestic,
+        strategy_overseas=strategy_overseas,
+        risk=cfg.get("risk", {}),
+        engine=cfg.get("engine", {}),
+        universe=cfg.get("universe", {}),
+        screener=cfg.get("screener", {}),
+        paper_account=paper_account,
+        real_account=real_account,
+    )
 
 
 def update_env(updates):
@@ -716,8 +738,18 @@ class KISApi:
         summ = d.get("output2") or {}
         if isinstance(summ, list):
             summ = summ[0] if summ else {}
-        cash = float(summ.get("frcr_dncl_amt_2") or summ.get("frcr_dncl_amt1")
-                     or summ.get("frcr_buy_psbl_amt1") or 0)
+        log.debug("해외잔고 요약 키(%s): %s", exch, list((summ or {}).keys()))
+        cash = _first_float(
+            summ,
+            (
+                "frcr_dncl_amt_2",
+                "frcr_dncl_amt1",
+                "frcr_dncl_amt",
+                "frcr_buy_psbl_amt1",
+                "ovrs_ord_psbl_amt",
+                "ovrs_tot_dncl_amt",
+            ),
+        )
         total_eval = _first_float(
             summ,
             ("tot_evlu_amt", "ovrs_tot_evlu_amt", "frcr_evlu_tota", "frcr_evlu_amt2"),
@@ -840,10 +872,11 @@ def _atr(candles, n=14):
     return sum(trs) / n
 
 
-def _vol_breakout_target(candles, k=0.5):
+def _vol_breakout_target(candles, k=0.5, current_open=None):
     if len(candles) < 2:
         return None
-    return candles[-1]["open"] + (candles[-2]["high"] - candles[-2]["low"]) * k
+    today_open = current_open if current_open and current_open > 0 else candles[-1]["open"]
+    return today_open + (candles[-2]["high"] - candles[-2]["low"]) * k
 
 
 def _highest_high(candles, n):
@@ -887,6 +920,7 @@ class Signal:
     price: float
     adx: float = 0.0          # 추세 강도(0~100)
     trend_ok: bool = True     # 장기추세(레짐) 통과 여부
+    vol_target: float = 0.0    # 변동성 돌파 목표가
 
 
 class CompositeStrategy:
@@ -896,7 +930,7 @@ class CompositeStrategy:
         self.buy_th = self.cfg.get("buy_threshold", 2)
         self.sell_th = self.cfg.get("sell_threshold", 2)
 
-    def evaluate(self, candles, price=None):
+    def evaluate(self, candles, price=None, current_open=None):
         if not candles or len(candles) < 30:
             return Signal("hold", 0, 0, ["데이터 부족"], price or 0)
         closes = [c["close"] for c in candles]
@@ -905,6 +939,7 @@ class CompositeStrategy:
         reasons = []
         adx_val = _adx(candles, (self.ind.get("adx", {}) or {}).get("period", 14))
         trend_ok = True
+        vol_target = 0.0
 
         c = self.ind.get("ma_cross", {})
         if c.get("enabled"):
@@ -950,9 +985,9 @@ class CompositeStrategy:
         c = self.ind.get("vol_breakout", {})
         if c.get("enabled"):
             w = c.get("weight", 2)
-            tgt = _vol_breakout_target(candles, c.get("k", 0.5))
-            if tgt and p >= tgt > 0:
-                buy += w; reasons.append(f"변동성돌파({tgt:.2f}) +{w}")
+            vol_target = _vol_breakout_target(candles, c.get("k", 0.5), current_open=current_open) or 0.0
+            if vol_target and p >= vol_target > 0:
+                buy += w; reasons.append(f"변동성돌파({vol_target:.2f}) +{w}")
 
         # N일 신고가 돌파 (레퍼런스: new_high_breakout)
         c = self.ind.get("new_high", {})
@@ -989,7 +1024,7 @@ class CompositeStrategy:
                 if act == "buy":
                     act = "hold"
                     reasons.append(f"추세필터: 가격<{ma_p}일선 매수보류")
-        return Signal(act, buy, sell, reasons, p, adx_val or 0.0, trend_ok)
+        return Signal(act, buy, sell, reasons, p, adx=adx_val or 0.0, trend_ok=trend_ok, vol_target=vol_target)
 
 
 # ===================================================================== #
@@ -1248,6 +1283,8 @@ class Trader:
         self.s = s
         self.api = KISApi(s)
         self.strategy = CompositeStrategy(s.strategy)
+        self.strategy_domestic = CompositeStrategy(getattr(s, "strategy_domestic", None) or s.strategy)
+        self.strategy_overseas = CompositeStrategy(getattr(s, "strategy_overseas", None) or s.strategy)
         self.risk = RiskManager(s.risk, state_path=risk_state_path(s.mode))
         self.journal = journal or TradeJournal()
         self.notify = notify or (lambda m: None)
@@ -1296,7 +1333,7 @@ class Trader:
             candles = self.api.domestic_daily(code)
             q = self.api.domestic_price(code)
             price = q["price"]
-            sig = self.strategy.evaluate(candles, price)
+            sig = self.strategy_domestic.evaluate(candles, price, current_open=q.get("open"))
             self.last_signals[code] = sig
             pos = next((p for p in bal["positions"] if p["code"] == code), None)
             if pos:
@@ -1341,7 +1378,7 @@ class Trader:
             candles = self.api.overseas_daily(sym, exch)
             q = self.api.overseas_price(sym, exch)
             price = q["price"]
-            sig = self.strategy.evaluate(candles, price)
+            sig = self.strategy_overseas.evaluate(candles, price, current_open=q.get("open"))
             self.last_signals[sym] = sig
             pos = next((p for p in obal["positions"] if p["code"] == sym), None)
             if pos:
@@ -1633,6 +1670,18 @@ class Trader:
             )
         return "\n".join(L)
 
+    def daily_report(self):
+        """텔레그램에서 즉시 조회할 수 있는 오늘 실현손익 요약."""
+        today = today_str()
+        s = self.journal.summary(today, today, self.s.mode)
+        return "\n".join([
+            f"📆 오늘 리포트({self.s.mode})",
+            f"거래 {s['trades']}건 · 매수 {s['buys']}건 · 매도 {s['sells']}건",
+            f"실현손익 {s['realized_pnl']:+,.0f}",
+            f"승/패 {s['wins']}/{s['losses']} · 승률 {s['win_rate']:.1f}%",
+            f"매수금액 {s['buy_amount']:,.0f} · 매도금액 {s['sell_amount']:,.0f}",
+        ])
+
 
 # ===================================================================== #
 #  텔레그램 봇 (선택 — 라이브러리 있을 때만)
@@ -1660,6 +1709,7 @@ class TelegramController:
         h(CommandHandler("auto", self.c_auto))
         h(CommandHandler("run", self.c_run))
         h(CommandHandler("signals", self.c_sig))
+        h(CommandHandler("daily", self.c_daily))
         h(CommandHandler("buy", self.c_buy))
         h(CommandHandler("sell", self.c_sell))
         h(CommandHandler("liquidate", self.c_liq))
@@ -1687,7 +1737,7 @@ class TelegramController:
         if not await self._ok(u):
             return
         await u.message.reply_text(
-            "🤖 명령어\n/status /portfolio\n/auto on|off\n/run /signals\n"
+            "🤖 명령어\n/status /portfolio /daily\n/auto on|off\n/run /signals\n"
             "/buy 005930 10  | /buy AAPL 1 us NAS\n/sell ...\n/liquidate\n"
             f"모드: {self.s.mode}")
 
@@ -1739,6 +1789,13 @@ class TelegramController:
             e = {"buy": "📈", "sell": "📉", "hold": "⏸"}.get(s.action, "")
             L.append(f"{e} {code}: {s.action} (매수{s.score_buy:.0f}/매도{s.score_sell:.0f})")
         await u.message.reply_text("\n".join(L))
+
+    async def c_daily(self, u, c):
+        import asyncio
+        if not await self._ok(u):
+            return
+        r = await asyncio.to_thread(self.trader.daily_report)
+        await u.message.reply_text(r)
 
     def _parse(self, args):
         if len(args) < 2:

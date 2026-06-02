@@ -5,6 +5,7 @@ auto_trade_enabled=False 면 주문 없이 시그널 알림만(반자동).
 """
 import concurrent.futures
 import os
+import sqlite3
 import threading
 import time
 from datetime import datetime
@@ -16,6 +17,7 @@ from .logger import get_logger
 
 log = get_logger("trader")
 _BASE = os.path.dirname(os.path.dirname(__file__))
+_DB_PATH = os.path.join(_BASE, "trades.db")
 
 
 def risk_state_path(mode: str) -> str:
@@ -88,12 +90,107 @@ def _format_balance_lines(krw_value, usd_value=0, include_usd: bool = False, sig
     return "\n".join(lines)
 
 
+class TradeJournal:
+    """모듈형 실행 경로의 주문 결과를 `trades.db`에 기록하고 기간 요약을 제공한다."""
+
+    def __init__(self, path: str = _DB_PATH):
+        self.path = path
+        self.lock = threading.Lock()
+        self._init_db()
+
+    def _init_db(self):
+        conn = sqlite3.connect(self.path)
+        try:
+            with self.lock:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS trades(
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        ts TEXT, date TEXT, mode TEXT, market TEXT,
+                        code TEXT, name TEXT, side TEXT, qty INTEGER,
+                        price REAL, amount REAL, reason TEXT,
+                        pnl REAL, ok INTEGER, msg TEXT)
+                    """
+                )
+                conn.commit()
+        finally:
+            conn.close()
+
+    def log(self, mode, market, code, name, side, qty, price, reason="", pnl=None, ok=True, msg=""):
+        """주문 결과 1건을 현재 모드와 시장 구분으로 저장한다."""
+        now = datetime.now()
+        conn = sqlite3.connect(self.path)
+        try:
+            with self.lock:
+                conn.execute(
+                    "INSERT INTO trades(ts,date,mode,market,code,name,side,qty,price,amount,reason,pnl,ok,msg)"
+                    " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        now.strftime("%Y-%m-%d %H:%M:%S"),
+                        now.strftime("%Y-%m-%d"),
+                        mode,
+                        market,
+                        code,
+                        name or code,
+                        side,
+                        int(qty),
+                        float(price or 0),
+                        float(qty) * float(price or 0),
+                        reason,
+                        pnl,
+                        1 if ok else 0,
+                        msg,
+                    ),
+                )
+                conn.commit()
+        finally:
+            conn.close()
+
+    def summary(self, start_date, end_date, mode=None):
+        """기간(YYYY-MM-DD) 집계."""
+        conn = sqlite3.connect(self.path)
+        try:
+            conn.row_factory = sqlite3.Row
+            with self.lock:
+                if mode:
+                    rows = conn.execute(
+                        "SELECT * FROM trades WHERE date>=? AND date<=? AND ok=1 AND mode=?",
+                        (start_date, end_date, mode),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        "SELECT * FROM trades WHERE date>=? AND date<=? AND ok=1",
+                        (start_date, end_date),
+                    ).fetchall()
+        finally:
+            conn.close()
+        buys = [r for r in rows if r["side"] == "buy"]
+        sells = [r for r in rows if r["side"] == "sell"]
+        pnls = [r["pnl"] for r in sells if r["pnl"] is not None]
+        wins = [p for p in pnls if p > 0]
+        losses = [p for p in pnls if p <= 0]
+        return {
+            "trades": len(rows),
+            "buys": len(buys),
+            "sells": len(sells),
+            "buy_amount": sum(r["amount"] for r in buys),
+            "sell_amount": sum(r["amount"] for r in sells),
+            "realized_pnl": sum(pnls) if pnls else 0.0,
+            "wins": len(wins),
+            "losses": len(losses),
+            "win_rate": (len(wins) / len(pnls) * 100) if pnls else 0.0,
+        }
+
+
 class Trader:
     def __init__(self, settings, notify=None):
         self.s = settings
         self.api = KISApi(settings)
         self.strategy = CompositeStrategy(settings.strategy)
+        self.strategy_domestic = CompositeStrategy(getattr(settings, "strategy_domestic", None) or settings.strategy)
+        self.strategy_overseas = CompositeStrategy(getattr(settings, "strategy_overseas", None) or settings.strategy)
         self.risk = RiskManager(settings.risk, state_path=risk_state_path(settings.mode))
+        self.journal = TradeJournal()
         self.notify = notify or (lambda msg: None)  # 알림 콜백
         self.auto_enabled = settings.engine.get("auto_trade_enabled", True)
         self.running = False
@@ -232,7 +329,7 @@ class Trader:
         try:
             candles = self.api.domestic_daily(code, count=120)
             quote = self.api.domestic_price(code)
-            sig = self.strategy.evaluate(
+            sig = self.strategy_domestic.evaluate(
                 candles,
                 current_price=quote["price"],
                 current_open=quote.get("open"),
@@ -251,7 +348,9 @@ class Trader:
                     why = reason or "전략 매도신호"
                     if self.auto_enabled:
                         res = self.api.domestic_order(code, pos["qty"], "sell", price=0)
-                        self._report_order("매도", code, pos["qty"], quote["price"], why, res)
+                        pnl = (_to_float(quote["price"]) - _to_float(pos["avg_price"])) * _to_float(pos["qty"])
+                        self._report_order("매도", code, pos["qty"], quote["price"], why, res,
+                                           market="domestic", side="sell", name=pos.get("name", code), pnl=pnl)
                         if res.get("ok"):
                             self._peak.pop(key, None)
                             self._cooldown[key] = time.time()
@@ -271,7 +370,8 @@ class Trader:
                 reason = ", ".join(sig.reasons)
                 if self.auto_enabled:
                     res = self.api.domestic_order(code, qty, "buy", price=0)
-                    self._report_order("매수", code, qty, quote["price"], reason, res)
+                    self._report_order("매수", code, qty, quote["price"], reason, res,
+                                       market="domestic", side="buy", name=code)
                     if res.get("ok"):
                         self._peak[self._peak_key("domestic", code)] = _to_float(quote["price"])
                 else:
@@ -286,7 +386,7 @@ class Trader:
         try:
             candles = self.api.overseas_daily(symbol, exch, count=120)
             quote = self.api.overseas_price(symbol, exch)
-            sig = self.strategy.evaluate(
+            sig = self.strategy_overseas.evaluate(
                 candles,
                 current_price=quote["price"],
                 current_open=quote.get("open"),
@@ -311,7 +411,9 @@ class Trader:
                     if self.auto_enabled:
                         res = self.api.overseas_order(symbol, pos["qty"], "sell",
                                                       price=quote["price"], exchange=exch)
-                        self._report_order("매도(美)", symbol, pos["qty"], quote["price"], why, res)
+                        pnl = (_to_float(quote["price"]) - _to_float(pos["avg_price"])) * _to_float(pos["qty"])
+                        self._report_order("매도(美)", symbol, pos["qty"], quote["price"], why, res,
+                                           market="overseas", side="sell", name=pos.get("name", symbol), pnl=pnl)
                         if res.get("ok"):
                             self._peak.pop(key, None)
                             self._cooldown[key] = time.time()
@@ -332,7 +434,8 @@ class Trader:
                 if self.auto_enabled:
                     res = self.api.overseas_order(symbol, qty, "buy",
                                                   price=quote["price"], exchange=exch)
-                    self._report_order("매수(美)", symbol, qty, quote["price"], reason, res)
+                    self._report_order("매수(美)", symbol, qty, quote["price"], reason, res,
+                                       market="overseas", side="buy", name=symbol)
                     if res.get("ok"):
                         self._peak[self._peak_key("overseas", symbol, exch)] = _to_float(quote["price"])
                 else:
@@ -341,11 +444,27 @@ class Trader:
             log.exception("해외 처리 오류 %s", symbol)
             self.notify(f"⚠️ {symbol} 처리 오류: {e}")
 
-    def _report_order(self, kind, code, qty, price, reason, res):
+    def _report_order(self, kind, code, qty, price, reason, res, market="", side="", name="", pnl=None):
         status = "✅성공" if res.get("ok") else f"❌실패({res.get('msg')})"
         msg = f"{kind} {code} {qty}주 @{price:,.2f}\n사유: {reason}\n결과: {status}"
         self.notify(msg)
         log.info(msg.replace("\n", " | "))
+        if market and side:
+            journal = getattr(self, "journal", None)
+            if journal:
+                journal.log(
+                    getattr(self.s, "mode", "paper"),
+                    market,
+                    code,
+                    name or code,
+                    side,
+                    qty,
+                    price,
+                    reason,
+                    pnl,
+                    res.get("ok"),
+                    res.get("msg", ""),
+                )
 
     def _process_with_timeout(self, label: str, target, timeout: int, *args):
         """종목 하나가 지연돼도 전체 스캔이 계속되도록 처리 시간을 제한한다."""
@@ -480,14 +599,28 @@ class Trader:
     #  수동 명령 (텔레그램에서 호출)
     # ----------------------------------------------------------------- #
     def manual_buy(self, code, qty, overseas=False, exchange="NAS"):
+        market = "overseas" if overseas else "domestic"
         if overseas:
-            return self.api.overseas_order(code, qty, "buy", price=0, exchange=exchange)
-        return self.api.domestic_order(code, qty, "buy", price=0)
+            res = self.api.overseas_order(code, qty, "buy", price=0, exchange=exchange)
+        else:
+            res = self.api.domestic_order(code, qty, "buy", price=0)
+        journal = getattr(self, "journal", None)
+        if journal:
+            journal.log(getattr(self.s, "mode", "paper"), market, code, code, "buy", qty, 0, "수동매수", None,
+                        res.get("ok"), res.get("msg", ""))
+        return res
 
     def manual_sell(self, code, qty, overseas=False, exchange="NAS"):
+        market = "overseas" if overseas else "domestic"
         if overseas:
-            return self.api.overseas_order(code, qty, "sell", price=0, exchange=exchange)
-        return self.api.domestic_order(code, qty, "sell", price=0)
+            res = self.api.overseas_order(code, qty, "sell", price=0, exchange=exchange)
+        else:
+            res = self.api.domestic_order(code, qty, "sell", price=0)
+        journal = getattr(self, "journal", None)
+        if journal:
+            journal.log(getattr(self.s, "mode", "paper"), market, code, code, "sell", qty, 0, "수동매도", None,
+                        res.get("ok"), res.get("msg", ""))
+        return res
 
     def liquidate_all(self):
         """국내/미국 전체 청산."""
@@ -496,11 +629,22 @@ class Trader:
         results = []
         for p in bal.get("positions", []):
             res = self.api.domestic_order(p["code"], p["qty"], "sell", price=0)
+            price = _to_float(p.get("cur_price")) or _to_float(p.get("avg_price"))
+            pnl = (price - _to_float(p.get("avg_price"))) * _to_float(p.get("qty"))
+            journal = getattr(self, "journal", None)
+            if journal:
+                journal.log(getattr(self.s, "mode", "paper"), "domestic", p["code"], p.get("name", p["code"]), "sell",
+                            p["qty"], price, "전체청산", pnl, res.get("ok"), res.get("msg", ""))
             results.append((p["code"], res.get("ok")))
         for p in overseas.get("positions", []):
             exchange = p.get("exchange", "NAS")
             price = _to_float(p.get("cur_price")) or _to_float(p.get("avg_price"))
             res = self.api.overseas_order(p["code"], p["qty"], "sell", price=price, exchange=exchange)
+            pnl = (price - _to_float(p.get("avg_price"))) * _to_float(p.get("qty"))
+            journal = getattr(self, "journal", None)
+            if journal:
+                journal.log(getattr(self.s, "mode", "paper"), "overseas", p["code"], p.get("name", p["code"]), "sell",
+                            p["qty"], price, "전체청산", pnl, res.get("ok"), res.get("msg", ""))
             results.append((f"{exchange}:{p['code']}", res.get("ok")))
         return results
 
@@ -526,3 +670,16 @@ class Trader:
                 f"({p['pnl_rate']:+.2f}%)"
             )
         return "\n".join(lines)
+
+    def daily_report(self) -> str:
+        """오늘 주문 기록 기준 실현손익과 거래 건수를 반환한다."""
+        today = datetime.now().strftime("%Y-%m-%d")
+        mode = getattr(self.s, "mode", "paper")
+        s = self.journal.summary(today, today, mode)
+        return "\n".join([
+            f"📆 오늘 리포트 ({mode})",
+            f"거래 {s['trades']}건 · 매수 {s['buys']}건 · 매도 {s['sells']}건",
+            f"실현손익 {s['realized_pnl']:+,.0f}",
+            f"승/패 {s['wins']}/{s['losses']} · 승률 {s['win_rate']:.1f}%",
+            f"매수금액 {s['buy_amount']:,.0f} · 매도금액 {s['sell_amount']:,.0f}",
+        ])

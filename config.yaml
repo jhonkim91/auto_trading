@@ -59,6 +59,13 @@ strategy:
     adx:         { enabled: true,  period: 14, min: 20, penalty: 1 }    # 추세 강도 약하면 매수점수 차감
     regime:      { enabled: true,  ma: 60 }                             # 가격이 60일선 아래면 신규매수 보류(하락장 방지)
 
+# 국내/해외 전략 파라미터 override
+# 비워두면 위 strategy를 그대로 사용하고, 필요한 키만 적으면 strategy 기본값과 재귀 병합됩니다.
+strategy_domestic: {}
+strategy_overseas:
+  # 예: 미국 대형주는 신호를 조금 더 보수적으로 운용
+  buy_threshold: 4
+
 # 리스크 관리
 risk:
   max_positions: 5               # 동시 보유 최대 종목 수

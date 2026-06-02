@@ -32,6 +32,8 @@ _DEFAULT_CONFIG = {
         "sell_threshold": 2,
         "indicators": {},
     },
+    "strategy_domestic": {},
+    "strategy_overseas": {},
     "risk": {
         "max_positions": 5,
         "risk_per_trade_pct": 1.0,
@@ -62,6 +64,8 @@ class Settings:
     telegram_token: str
     allowed_chat_ids: list
     strategy: dict = field(default_factory=dict)
+    strategy_domestic: dict = field(default_factory=dict)
+    strategy_overseas: dict = field(default_factory=dict)
     risk: dict = field(default_factory=dict)
     engine: dict = field(default_factory=dict)
     universe: dict = field(default_factory=dict)
@@ -137,6 +141,9 @@ def load_settings() -> Settings:
     allowed = [c.strip() for c in chat_ids_raw.split(",") if c.strip()]
 
     cfg = _load_config()
+    base_strategy = cfg.get("strategy", {})
+    strategy_domestic = _deep_merge(base_strategy, cfg.get("strategy_domestic", {}))
+    strategy_overseas = _deep_merge(base_strategy, cfg.get("strategy_overseas", {}))
 
     return Settings(
         mode=mode,
@@ -146,7 +153,9 @@ def load_settings() -> Settings:
         account_prod=account_prod,
         telegram_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
         allowed_chat_ids=allowed,
-        strategy=cfg.get("strategy", {}),
+        strategy=base_strategy,
+        strategy_domestic=strategy_domestic,
+        strategy_overseas=strategy_overseas,
         risk=cfg.get("risk", {}),
         engine=cfg.get("engine", {}),
         universe=cfg.get("universe", {}),

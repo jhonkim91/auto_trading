@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from autotrader import Settings as GuiSettings
+from autotrader import KISApi as GuiKISApi
 from autotrader import RiskManager as GuiRiskManager
 from autotrader import TradeJournal
 from autotrader import build_portfolio_snapshot as build_gui_snapshot
@@ -17,6 +18,7 @@ from src.kis_api import KISApi
 from src.kis_api import KIS_INTERVAL_PAPER, KIS_INTERVAL_REAL, KIS_RATE_PAPER, KIS_RATE_REAL
 from src.risk import RiskManager
 from src.trader import Trader
+from src.trader import TradeJournal as ModuleTradeJournal
 from src.trader import build_portfolio_snapshot as build_module_snapshot
 
 
@@ -258,6 +260,15 @@ class PortfolioSnapshotTests(unittest.TestCase):
         self.assertEqual(calls[0][1], "VTTS3007R")
         self.assertEqual(calls[0][2]["ITEM_CD"], "QQQ")
 
+    def test_gui_overseas_balance_uses_extended_cash_fallback(self):
+        api = GuiKISApi.__new__(GuiKISApi)
+        api.s = SimpleNamespace(is_paper=True, account_no="12345678", account_prod="01")
+        api._get = lambda *args, **kwargs: {"output1": [], "output2": {"ovrs_tot_dncl_amt": "123.45"}}
+
+        result = api.overseas_balance("NAS")
+
+        self.assertEqual(result["cash"], 123.45)
+
     def test_kis_domestic_volume_rank_parses_candidates(self):
         calls = []
         api = KISApi.__new__(KISApi)
@@ -396,7 +407,7 @@ class PortfolioSnapshotTests(unittest.TestCase):
         trader = Trader.__new__(Trader)
         trader.s = SimpleNamespace(risk={"cooldown_min": 30})
         trader.api = fake_api
-        trader.strategy = SimpleNamespace(evaluate=lambda *args, **kwargs: SimpleNamespace(action="buy", reasons=["test"]))
+        trader.strategy_domestic = SimpleNamespace(evaluate=lambda *args, **kwargs: SimpleNamespace(action="buy", reasons=["test"]))
         trader.risk = SimpleNamespace(can_open_new=lambda current_positions: True,
                                       position_size=lambda cash, price, candles: 1)
         trader.auto_enabled = True
@@ -447,12 +458,13 @@ class PortfolioSnapshotTests(unittest.TestCase):
         trader.s = SimpleNamespace(screener={"overseas_use_buyable": True})
         trader.api = api
         trader.risk = risk
-        trader.strategy = SimpleNamespace(
+        trader.strategy_overseas = SimpleNamespace(
             evaluate=lambda candles, current_price=None, current_open=None: SimpleNamespace(
                 action="buy",
                 reasons=["test"],
             )
         )
+        trader.journal = SimpleNamespace(log=lambda *args, **kwargs: None)
         trader.auto_enabled = True
         trader.last_signals = {}
         trader._peak = {}
@@ -463,6 +475,37 @@ class PortfolioSnapshotTests(unittest.TestCase):
 
         self.assertEqual(risk.cash_seen, 5000)
         self.assertEqual(api.orders, [("QQQ", 3, "buy", 100, "NAS")])
+
+    def test_module_daily_report_uses_mode_filtered_journal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = ModuleTradeJournal(os.path.join(tmp, "trades.db"))
+            journal.log("paper", "domestic", "005930", "삼성전자", "sell", 1, 71000, "test", 1000, True)
+            journal.log("real", "domestic", "000660", "SK하이닉스", "sell", 1, 120000, "test", -500, True)
+            trader = Trader.__new__(Trader)
+            trader.s = SimpleNamespace(mode="paper")
+            trader.journal = journal
+
+            report = trader.daily_report()
+
+            self.assertIn("오늘 리포트 (paper)", report)
+            self.assertIn("실현손익 +1,000", report)
+
+    def test_market_specific_strategy_settings_are_exposed(self):
+        module_settings = ModuleSettings(
+            mode="paper",
+            app_key="k",
+            app_secret="s",
+            account_no="1",
+            account_prod="01",
+            telegram_token="t",
+            allowed_chat_ids=["1"],
+            strategy={"buy_threshold": 3},
+            strategy_domestic={"buy_threshold": 2},
+            strategy_overseas={"buy_threshold": 4},
+        )
+
+        self.assertEqual(module_settings.strategy_domestic["buy_threshold"], 2)
+        self.assertEqual(module_settings.strategy_overseas["buy_threshold"], 4)
 
 
 if __name__ == "__main__":

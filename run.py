@@ -49,7 +49,8 @@ def cmd_backtest(code: str):
         print("데이터를 가져오지 못했습니다.")
         return
     print(f"{len(candles)}봉 로드. 백테스트 실행...")
-    res = run_backtest(candles, s.strategy)
+    strategy_cfg = s.strategy_domestic if market == "domestic" else s.strategy_overseas
+    res = run_backtest(candles, strategy_cfg)
     print("\n===== 백테스트 결과 =====")
     for k, v in res.items():
         print(f"{k:18}: {v}")

@@ -8,6 +8,7 @@ python-telegram-bot v20+ (async). 보안: 허용된 chat_id 화이트리스트.
   /auto on|off   - 자동매매 on/off
   /run           - 지금 1회 스캔 실행
   /signals       - 최근 시그널 요약
+  /daily         - 오늘 P&L 요약
   /buy  <코드> <수량> [us <거래소>]  - 수동 매수
   /sell <코드> <수량> [us <거래소>]  - 수동 매도
   /liquidate     - 국내/미국 전체 청산
@@ -48,6 +49,7 @@ class TelegramController:
         h(CommandHandler("auto", self.cmd_auto))
         h(CommandHandler("run", self.cmd_run))
         h(CommandHandler("signals", self.cmd_signals))
+        h(CommandHandler("daily", self.cmd_daily))
         h(CommandHandler("buy", self.cmd_buy))
         h(CommandHandler("sell", self.cmd_sell))
         h(CommandHandler("liquidate", self.cmd_liquidate))
@@ -101,6 +103,7 @@ class TelegramController:
             "/auto on|off - 자동매매 전환\n"
             "/run - 즉시 1회 스캔\n"
             "/signals - 최근 시그널\n"
+            "/daily - 오늘 P&L 요약\n"
             "/buy <코드> <수량> [us NAS] - 수동 매수\n"
             "/sell <코드> <수량> [us NAS] - 수동 매도\n"
             "/liquidate - 국내/미국 전체 청산\n"
@@ -158,6 +161,12 @@ class TelegramController:
             emoji = {"buy": "📈", "sell": "📉", "hold": "⏸️"}.get(s.action, "")
             lines.append(f"{emoji} {code}: {s.action} (매수{s.score_buy:.0f}/매도{s.score_sell:.0f}) @ {s.price:,.2f}")
         await update.message.reply_text("\n".join(lines))
+
+    async def cmd_daily(self, update: Update, ctx):
+        if not await self._guard(update):
+            return
+        report = await asyncio.to_thread(self.trader.daily_report)
+        await update.message.reply_text(report)
 
     def _parse_order_args(self, args):
         """<코드> <수량> [us <거래소>] 파싱."""
