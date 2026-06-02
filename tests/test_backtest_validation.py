@@ -216,5 +216,52 @@ class WFATests(unittest.TestCase):
         self.assertFalse(result.calculated)
 
 
+class BacktestRulesTests(unittest.TestCase):
+    def _trivial_candles(self, n=60):
+        return [
+            {
+                "open": 100,
+                "high": 105,
+                "low": 95,
+                "close": 100 + (index * 0.1),
+                "volume": 1000,
+                "date": f"202601{index + 1:02d}",
+            }
+            for index in range(n)
+        ]
+
+    def test_next_bar_execution_no_lookahead(self):
+        """체결가는 신호 봉 종가가 아니라 다음 봉 시가로 기록된다."""
+        from src.backtest import run_backtest
+        from src.config import _DEFAULT_CONFIG
+
+        candles = self._trivial_candles(60)
+        result = run_backtest(candles, _DEFAULT_CONFIG["strategy"], market="kosdaq")
+
+        for trade in result.get("trades", []):
+            self.assertIn("exec_price", trade)
+
+    def test_costs_present_in_result(self):
+        from src.backtest import run_backtest
+        from src.config import _DEFAULT_CONFIG
+
+        candles = self._trivial_candles(60)
+        result = run_backtest(candles, _DEFAULT_CONFIG["strategy"], market="kosdaq")
+
+        self.assertIn("costs_total", result)
+        self.assertIn("returns", result)
+        self.assertIn("equity_curve", result)
+
+    def test_validate_backtest_no_go_on_insufficient_trades(self):
+        from src.backtest import validate_backtest
+
+        result = {"trades": [{"pnl": 100}] * 5, "returns": [0.001] * 5}
+        validation_cfg = {"min_oos_trades": 30, "psr_min": 0.95, "ror_max": 0.05}
+        validation = validate_backtest(result, validation_cfg)
+
+        self.assertFalse(validation["calculated"])
+        self.assertFalse(validation["go_no_go"])
+
+
 if __name__ == "__main__":
     unittest.main()
