@@ -7,7 +7,7 @@ import unittest
 import numpy as np
 import pandas as pd
 
-from src import costs
+from src import costs, metrics
 
 
 class CostTests(unittest.TestCase):
@@ -41,6 +41,49 @@ class CostTests(unittest.TestCase):
 
         self.assertGreater(pct, 0.22)
         self.assertLess(pct, 0.26)
+
+
+class MetricsTests(unittest.TestCase):
+    def _daily_returns(self, annual_return=0.10, n=252, seed=42):
+        np.random.seed(seed)
+        return np.random.normal(annual_return / 252, 0.01, n)
+
+    def test_sharpe_positive_strategy(self):
+        returns = self._daily_returns(0.20)
+        sharpe = metrics.sharpe(returns, rf=0.025)
+
+        self.assertGreater(sharpe, 0)
+
+    def test_psr_high_for_good_strategy(self):
+        returns = self._daily_returns(0.30, n=500)
+        psr = metrics.psr(returns)
+
+        self.assertGreater(psr, 0.90)
+
+    def test_psr_low_for_poor_strategy(self):
+        np.random.seed(1)
+        returns = np.random.normal(-0.001, 0.01, 50)
+        psr = metrics.psr(returns)
+
+        self.assertLess(psr, 0.50)
+
+    def test_omega_above_one_for_positive(self):
+        returns = self._daily_returns(0.15)
+
+        self.assertGreater(metrics.omega(returns), 1.0)
+
+    def test_mdd_negative(self):
+        equity = np.cumprod(1 + self._daily_returns(0.10))
+
+        self.assertLess(metrics.max_drawdown(equity), 0)
+
+    def test_dsr_requires_multiple_trials(self):
+        returns = self._daily_returns(0.20, n=252)
+        trials = [0.05, 0.08, 0.12, 0.15]
+        dsr = metrics.deflated_sharpe(returns, trials)
+
+        self.assertGreater(dsr, 0)
+        self.assertLessEqual(dsr, 1.0)
 
 
 if __name__ == "__main__":
