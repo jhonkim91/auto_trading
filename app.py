@@ -11,6 +11,7 @@
   - 실시간 로그 패널
 표준 라이브러리 Tkinter만 사용 (추가 GUI 설치 불필요).
 """
+import os
 import queue
 import threading
 import logging
@@ -33,6 +34,20 @@ PANEL = "#27293d"
 
 def mode_label(mode):
     return "실전" if mode == "real" else "모의"
+
+
+def _clear_token_cache() -> bool:
+    """계좌/모드 변경 시 기존 KIS 토큰 캐시를 삭제한다."""
+    token_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "token.dat")
+    if not os.path.exists(token_path):
+        return False
+    try:
+        os.remove(token_path)
+        log.info("KIS 토큰 캐시 삭제: %s", token_path)
+        return True
+    except OSError as e:
+        log.warning("KIS 토큰 캐시 삭제 실패: %s", e)
+        return False
 
 
 class QueueLogHandler(logging.Handler):
@@ -202,7 +217,7 @@ class TradingApp:
         tk.Button(r4, text="매도", command=lambda: self.manual_order("sell"), bg=ACCENT,
                   fg="#000", relief="flat", width=12, font=("맑은 고딕", 11, "bold"),
                   cursor="hand2").pack(side="left", padx=6)
-        tk.Button(r4, text="⚠ 국내 전체청산", command=self.liquidate, bg="#888",
+        tk.Button(r4, text="⚠ 전체청산", command=self.liquidate, bg="#888",
                   fg="#000", relief="flat", width=16, cursor="hand2").pack(side="right", padx=6)
 
     def _build_settings(self):
@@ -298,6 +313,7 @@ class TradingApp:
         }
         try:
             update_env(updates)
+            token_removed = _clear_token_cache()
             if self.trader and self.trader.running:
                 self.trader.stop()
             if self.bot and self.bot.is_running:
@@ -309,6 +325,8 @@ class TradingApp:
             self.btn_engine.config(text="▶ 엔진 시작", bg=ACCENT)
             self.btn_bot.config(text="🤖 봇 시작", bg=PANEL)
             self._refresh_status()
+            if token_removed:
+                self._log("KIS 토큰 캐시 삭제됨 — 새 모드/계좌에서 재발급")
             messagebox.showinfo("저장 완료",
                                 "설정을 저장했습니다.\n선택한 모드의 계좌가 새 엔진에 적용됩니다.")
             self._log(f"설정 저장됨 (.env, 모드={self.settings.mode}) — 엔진 재시작 필요")
@@ -327,6 +345,7 @@ class TradingApp:
                 return
         try:
             update_env({"TRADING_MODE": new_mode})
+            token_removed = _clear_token_cache()
             if self.trader and self.trader.running:
                 self.trader.stop()
             if self.bot and self.bot.is_running:
@@ -339,6 +358,8 @@ class TradingApp:
             self.btn_bot.config(text="🤖 봇 시작", bg=PANEL)
             self._update_cfg_status()
             self._refresh_status()
+            if token_removed:
+                self._log("KIS 토큰 캐시 삭제됨 — 새 모드/계좌에서 재발급")
             self._log(f"계좌 모드 전환: {current} → {new_mode}")
             messagebox.showinfo("전환 완료", f"{mode_label(new_mode)} 계좌 모드로 전환했습니다.\n엔진을 다시 시작하세요.")
         except Exception as e:  # noqa
@@ -437,7 +458,7 @@ class TradingApp:
         threading.Thread(target=work, daemon=True).start()
 
     def liquidate(self):
-        if not messagebox.askyesno("전체 청산", "국내 보유 종목을 모두 시장가로 청산할까요?"):
+        if not messagebox.askyesno("전체 청산", "국내·미국 보유 종목을 모두 시장가로 청산할까요?"):
             return
         t = self._ensure_trader()
 

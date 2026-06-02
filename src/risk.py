@@ -5,15 +5,56 @@
 - 진입과 동시에 손절 라인 설정
 - 일일 손실 한도 / 최대낙폭(MDD) 한도 모니터링
 """
+import json
+import os
+from datetime import datetime
+
 from . import indicators as ind
 
 
 class RiskManager:
-    def __init__(self, risk_cfg: dict):
+    def __init__(self, risk_cfg: dict, state_path: str = None):
         self.cfg = risk_cfg or {}
+        self.state_path = state_path
+        self.state_date = None
         self.day_start_equity = None     # 당일 시작 자산
         self.peak_equity = None          # 최고 자산(MDD 계산용)
         self.halted = False              # 당일 매매 중단 여부
+        self._load_state()
+
+    def _today(self) -> str:
+        return datetime.now().strftime("%Y-%m-%d")
+
+    def _load_state(self):
+        if not self.state_path or not os.path.exists(self.state_path):
+            return
+        try:
+            with open(self.state_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.state_date = data.get("date")
+            self.day_start_equity = data.get("day_start_equity")
+            self.peak_equity = data.get("peak_equity")
+            self.halted = bool(data.get("halted", False))
+        except Exception:  # noqa
+            self.state_date = None
+            self.day_start_equity = None
+            self.peak_equity = None
+            self.halted = False
+
+    def _save_state(self):
+        if not self.state_path:
+            return
+        state_dir = os.path.dirname(self.state_path)
+        if state_dir:
+            os.makedirs(state_dir, exist_ok=True)
+        data = {
+            "date": self.state_date,
+            "day_start_equity": self.day_start_equity,
+            "peak_equity": self.peak_equity,
+            "halted": self.halted,
+        }
+        with open(self.state_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
 
     # ---- 포지션 사이징 ---- #
     def position_size(self, equity: float, price: float, candles: list = None) -> int:
@@ -43,13 +84,18 @@ class RiskManager:
         return qty
 
     # ---- 손절/익절 판단 ---- #
-    def should_exit(self, avg_price: float, cur_price: float) -> str:
-        """보유 포지션의 청산 사유 반환: 'stop_loss'|'take_profit'|''"""
+    def should_exit(self, avg_price: float, cur_price: float, peak_price: float = None) -> str:
+        """보유 포지션의 청산 사유 반환: 'stop_loss'|'trailing_stop'|'take_profit'|''"""
         if avg_price <= 0:
             return ""
         pnl_pct = (cur_price - avg_price) / avg_price * 100
         if pnl_pct <= -self.cfg.get("stop_loss_pct", 5.0):
             return "stop_loss"
+        trailing_stop_pct = self.cfg.get("trailing_stop_pct", 0.0) or 0.0
+        if trailing_stop_pct > 0 and peak_price and peak_price > avg_price and cur_price > avg_price:
+            pullback_pct = (cur_price - peak_price) / peak_price * 100
+            if pullback_pct <= -trailing_stop_pct:
+                return "trailing_stop"
         if pnl_pct >= self.cfg.get("take_profit_pct", 10.0):
             return "take_profit"
         return ""
@@ -59,14 +105,24 @@ class RiskManager:
 
     # ---- 일손실 / MDD 한도 ---- #
     def update_equity(self, equity: float):
-        if self.day_start_equity is None:
+        today = self._today()
+        if self.state_date != today:
+            self.state_date = today
+            self.day_start_equity = equity
+            self.halted = False
+        elif self.day_start_equity is None:
             self.day_start_equity = equity
         if self.peak_equity is None or equity > self.peak_equity:
             self.peak_equity = equity
+        self._save_state()
 
     def reset_day(self, equity: float):
+        self.state_date = self._today()
         self.day_start_equity = equity
         self.halted = False
+        if self.peak_equity is None or equity > self.peak_equity:
+            self.peak_equity = equity
+        self._save_state()
 
     def check_limits(self, equity: float) -> str:
         """한도 위반 시 사유 반환: 'daily_loss'|'max_drawdown'|''"""
@@ -75,10 +131,12 @@ class RiskManager:
             day_pnl = (equity - self.day_start_equity) / self.day_start_equity * 100
             if day_pnl <= -self.cfg.get("daily_loss_limit_pct", 3.0):
                 self.halted = True
+                self._save_state()
                 return "daily_loss"
         if self.peak_equity and self.peak_equity > 0:
             dd = (equity - self.peak_equity) / self.peak_equity * 100
             if dd <= -self.cfg.get("max_drawdown_pct", 15.0):
                 self.halted = True
+                self._save_state()
                 return "max_drawdown"
         return ""

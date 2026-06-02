@@ -1,4 +1,5 @@
 """환경설정(.env) 및 전략설정(config.yaml) 로더."""
+import copy
 import os
 from dataclasses import dataclass, field
 
@@ -13,6 +14,39 @@ REAL_BASE_URL = "https://openapi.koreainvestment.com:9443"
 PAPER_BASE_URL = "https://openapivts.koreainvestment.com:29443"
 REAL_WS_URL = "ws://ops.koreainvestment.com:21000"
 PAPER_WS_URL = "ws://ops.koreainvestment.com:31000"
+
+_DEFAULT_CONFIG = {
+    "engine": {
+        "loop_interval_sec": 60,
+        "domestic_session": "09:00-15:20",
+        "overseas_session": "23:30-06:00",
+        "auto_trade_enabled": True,
+    },
+    "screener": {
+        "enabled": False,
+        "overseas_use_buyable": True,
+    },
+    "strategy": {
+        "buy_threshold": 3,
+        "sell_threshold": 2,
+        "indicators": {},
+    },
+    "risk": {
+        "max_positions": 5,
+        "risk_per_trade_pct": 1.0,
+        "stop_loss_pct": 5.0,
+        "take_profit_pct": 10.0,
+        "trailing_stop_pct": 0.0,
+        "cooldown_min": 0,
+        "daily_loss_limit_pct": 3.0,
+        "max_drawdown_pct": 15.0,
+        "atr_period": 14,
+    },
+    "universe": {
+        "domestic": [],
+        "overseas": [],
+    },
+}
 
 
 @dataclass
@@ -30,6 +64,7 @@ class Settings:
     risk: dict = field(default_factory=dict)
     engine: dict = field(default_factory=dict)
     universe: dict = field(default_factory=dict)
+    screener: dict = field(default_factory=dict)
     paper_account: str = ""
     real_account: str = ""
 
@@ -59,6 +94,26 @@ def _split_account(raw: str):
     return raw, "01"
 
 
+def _deep_merge(base: dict, override: dict) -> dict:
+    """기본 설정에 YAML 설정을 재귀 병합한다."""
+    merged = copy.deepcopy(base)
+    for key, value in (override or {}).items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _load_config() -> dict:
+    cfg_path = os.path.join(_BASE, "config.yaml")
+    if not os.path.exists(cfg_path):
+        return copy.deepcopy(_DEFAULT_CONFIG)
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        loaded = yaml.safe_load(f) or {}
+    return _deep_merge(_DEFAULT_CONFIG, loaded)
+
+
 def load_settings() -> Settings:
     load_dotenv(env_path(), override=True)
     mode = os.getenv("TRADING_MODE", "paper").lower()
@@ -80,10 +135,7 @@ def load_settings() -> Settings:
     chat_ids_raw = os.getenv("TELEGRAM_ALLOWED_CHAT_IDS", "")
     allowed = [c.strip() for c in chat_ids_raw.split(",") if c.strip()]
 
-    # 전략/리스크 설정
-    cfg_path = os.path.join(_BASE, "config.yaml")
-    with open(cfg_path, "r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f) or {}
+    cfg = _load_config()
 
     return Settings(
         mode=mode,
@@ -97,6 +149,7 @@ def load_settings() -> Settings:
         risk=cfg.get("risk", {}),
         engine=cfg.get("engine", {}),
         universe=cfg.get("universe", {}),
+        screener=cfg.get("screener", {}),
         paper_account=paper_account,
         real_account=real_account,
     )

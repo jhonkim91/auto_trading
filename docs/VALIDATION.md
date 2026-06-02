@@ -1,0 +1,19 @@
+# 검증 결과
+
+## 2026-06-02 KIS 자동매매 개선 1-4차
+
+### 검증 명령
+```powershell
+py -m unittest discover -s tests -p "test_*.py"
+py -m compileall autotrader.py app.py src tests
+git diff --check
+```
+
+### 결과
+- `py -m unittest discover -s tests -p "test_*.py"`: 17 tests OK
+- `py -m compileall autotrader.py app.py src tests`: OK
+- `git diff --check`: 종료 코드 0
+
+### 참고
+- `git diff --check`에서 `LF will be replaced by CRLF` 경고가 표시됐지만 whitespace 오류는 없었다.
+- KIS 네트워크 실조회, 실전 주문, 실제 청산은 수행하지 않았다.

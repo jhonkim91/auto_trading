@@ -3,6 +3,7 @@
 텔레그램 봇과 분리(notify 콜백으로 알림). 국내/해외 종목 모두 처리.
 auto_trade_enabled=False 면 주문 없이 시그널 알림만(반자동).
 """
+import os
 import threading
 import time
 from datetime import datetime
@@ -13,6 +14,13 @@ from .risk import RiskManager
 from .logger import get_logger
 
 log = get_logger("trader")
+_BASE = os.path.dirname(os.path.dirname(__file__))
+
+
+def risk_state_path(mode: str) -> str:
+    """모드별 리스크 상태 파일 경로를 반환한다."""
+    safe_mode = "real" if mode == "real" else "paper"
+    return os.path.join(_BASE, "logs", f"risk_state_{safe_mode}.json")
 
 
 def _to_float(value) -> float:
@@ -84,13 +92,14 @@ class Trader:
         self.s = settings
         self.api = KISApi(settings)
         self.strategy = CompositeStrategy(settings.strategy)
-        self.risk = RiskManager(settings.risk)
+        self.risk = RiskManager(settings.risk, state_path=risk_state_path(settings.mode))
         self.notify = notify or (lambda msg: None)  # 알림 콜백
         self.auto_enabled = settings.engine.get("auto_trade_enabled", True)
         self.running = False
         self._thread = None
         self._stop_evt = threading.Event()
         self.last_signals = {}
+        self._peak = {}
 
     # ----------------------------------------------------------------- #
     #  종목 유니버스
@@ -101,6 +110,43 @@ class Trader:
     def _overseas_items(self):
         return self.s.universe.get("overseas", []) or []
 
+    def _overseas_exchanges(self):
+        """설정된 해외 종목의 거래소 목록을 중복 없이 반환한다."""
+        exchanges = []
+        for item in self._overseas_items():
+            exchange = item.get("exchange", "NAS")
+            if exchange not in exchanges:
+                exchanges.append(exchange)
+        for exchange in ("NAS", "NYS", "AMS"):
+            if exchange not in exchanges:
+                exchanges.append(exchange)
+        return exchanges
+
+    def _peak_key(self, market: str, code: str, exchange: str = "") -> str:
+        return f"{market}:{exchange}:{code}" if exchange else f"{market}:{code}"
+
+    def _overseas_buy_quantity(self, symbol: str, exchange: str, price: float, candles: list, balance: dict) -> int:
+        """해외 매수가능금액과 리스크 한도를 함께 반영해 매수 수량을 계산한다."""
+        cash = _to_float(balance.get("cash"))
+        max_qty = 0
+        screener = getattr(self.s, "screener", {}) or {}
+        if screener.get("overseas_use_buyable", True):
+            try:
+                buyable = self.api.overseas_buyable(symbol, price, exchange)
+                buyable_amount = _to_float(buyable.get("amount"))
+                buyable_qty = int(_to_float(buyable.get("qty")))
+                if buyable_amount > 0:
+                    cash = buyable_amount
+                if buyable_qty > 0:
+                    max_qty = buyable_qty
+            except Exception as e:  # noqa
+                log.warning("%s 매수가능금액 조회 실패, USD 예수금 기준 사용: %s", symbol, e)
+
+        qty = self.risk.position_size(cash, price, candles) if cash > 0 else max_qty
+        if max_qty > 0 and qty > 0:
+            qty = min(qty, max_qty)
+        return max(0, int(qty))
+
     # ----------------------------------------------------------------- #
     #  단일 종목 평가 + (자동이면) 주문
     # ----------------------------------------------------------------- #
@@ -108,19 +154,28 @@ class Trader:
         try:
             candles = self.api.domestic_daily(code, count=120)
             quote = self.api.domestic_price(code)
-            sig = self.strategy.evaluate(candles, current_price=quote["price"])
+            sig = self.strategy.evaluate(
+                candles,
+                current_price=quote["price"],
+                current_open=quote.get("open"),
+            )
             self.last_signals[code] = sig
 
             pos = next((p for p in balance["positions"] if p["code"] == code), None)
 
             # 보유중이면 손절/익절 먼저 체크
             if pos:
-                reason = self.risk.should_exit(pos["avg_price"], quote["price"])
+                key = self._peak_key("domestic", code)
+                peak = max(_to_float(self._peak.get(key)), _to_float(pos["avg_price"]), _to_float(quote["price"]))
+                self._peak[key] = peak
+                reason = self.risk.should_exit(pos["avg_price"], quote["price"], peak)
                 if reason or sig.action == "sell":
                     why = reason or "전략 매도신호"
                     if self.auto_enabled:
                         res = self.api.domestic_order(code, pos["qty"], "sell", price=0)
                         self._report_order("매도", code, pos["qty"], quote["price"], why, res)
+                        if res.get("ok"):
+                            self._peak.pop(key, None)
                     else:
                         self.notify(f"📉 [신호] {code} 매도 추천 ({why}) — 자동매매 OFF")
                     return
@@ -137,6 +192,8 @@ class Trader:
                 if self.auto_enabled:
                     res = self.api.domestic_order(code, qty, "buy", price=0)
                     self._report_order("매수", code, qty, quote["price"], reason, res)
+                    if res.get("ok"):
+                        self._peak[self._peak_key("domestic", code)] = _to_float(quote["price"])
                 else:
                     self.notify(f"📈 [신호] {code} 매수 추천 {qty}주 ({reason}) — 자동매매 OFF")
         except Exception as e:  # noqa
@@ -149,19 +206,34 @@ class Trader:
         try:
             candles = self.api.overseas_daily(symbol, exch, count=120)
             quote = self.api.overseas_price(symbol, exch)
-            sig = self.strategy.evaluate(candles, current_price=quote["price"])
+            sig = self.strategy.evaluate(
+                candles,
+                current_price=quote["price"],
+                current_open=quote.get("open"),
+            )
             self.last_signals[symbol] = sig
 
-            pos = next((p for p in balance["positions"] if p["code"] == symbol), None)
+            pos = next(
+                (
+                    p for p in balance["positions"]
+                    if p["code"] == symbol and p.get("exchange", exch) == exch
+                ),
+                None,
+            )
 
             if pos:
-                reason = self.risk.should_exit(pos["avg_price"], quote["price"])
+                key = self._peak_key("overseas", symbol, exch)
+                peak = max(_to_float(self._peak.get(key)), _to_float(pos["avg_price"]), _to_float(quote["price"]))
+                self._peak[key] = peak
+                reason = self.risk.should_exit(pos["avg_price"], quote["price"], peak)
                 if reason or sig.action == "sell":
                     why = reason or "전략 매도신호"
                     if self.auto_enabled:
                         res = self.api.overseas_order(symbol, pos["qty"], "sell",
                                                       price=quote["price"], exchange=exch)
                         self._report_order("매도(美)", symbol, pos["qty"], quote["price"], why, res)
+                        if res.get("ok"):
+                            self._peak.pop(key, None)
                     else:
                         self.notify(f"📉 [신호] {symbol} 매도 추천 ({why}) — 자동매매 OFF")
                     return
@@ -169,13 +241,17 @@ class Trader:
             if sig.action == "buy" and not pos:
                 if not self.risk.can_open_new(len(balance["positions"])):
                     return
-                # 해외는 USD 기준; 보유현금 정보가 제한적이라 1주 단위 보수적 매수
-                qty = 1
+                qty = self._overseas_buy_quantity(symbol, exch, quote["price"], candles, balance)
+                if qty < 1:
+                    log.info("%s 매수가능 수량 부족(1주 미만) — 건너뜀", symbol)
+                    return
                 reason = ", ".join(sig.reasons)
                 if self.auto_enabled:
                     res = self.api.overseas_order(symbol, qty, "buy",
                                                   price=quote["price"], exchange=exch)
                     self._report_order("매수(美)", symbol, qty, quote["price"], reason, res)
+                    if res.get("ok"):
+                        self._peak[self._peak_key("overseas", symbol, exch)] = _to_float(quote["price"])
                 else:
                     self.notify(f"📈 [신호] {symbol} 매수 추천 {qty}주 ({reason}) — 자동매매 OFF")
         except Exception as e:  # noqa
@@ -209,8 +285,10 @@ class Trader:
         for code in self._domestic_codes():
             self._process_domestic(code, balance)
 
-        for item in self._overseas_items():
-            self._process_overseas(item, balance)
+        overseas_items = self._overseas_items()
+        overseas_balance = self.safe_overseas_balance() if overseas_items else {"cash": 0, "total_eval": 0, "positions": []}
+        for item in overseas_items:
+            self._process_overseas(item, overseas_balance)
 
     def safe_domestic_balance(self):
         try:
@@ -220,13 +298,31 @@ class Trader:
             return {"cash": 0, "total_eval": 0, "positions": []}
 
     def safe_overseas_balance(self):
-        items = self._overseas_items()
-        exchange = items[0].get("exchange", "NAS") if items else "NAS"
-        try:
-            return self.api.overseas_balance(exchange)
-        except Exception as e:  # noqa
-            log.warning("미국 잔고조회 실패: %s", e)
-            return {"cash": 0, "total_eval": 0, "positions": []}
+        positions = []
+        seen = set()
+        cash_values = []
+        raw_by_exchange = {}
+        for exchange in self._overseas_exchanges():
+            try:
+                bal = self.api.overseas_balance(exchange)
+            except Exception as e:  # noqa
+                log.warning("미국 잔고조회 실패(%s): %s", exchange, e)
+                continue
+            cash_values.append(_to_float(bal.get("cash")))
+            raw_by_exchange[exchange] = bal.get("raw")
+            for position in bal.get("positions", []):
+                item = dict(position)
+                item["exchange"] = item.get("exchange", exchange)
+                key = (item.get("exchange"), item.get("code"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                positions.append(item)
+
+        cash = max(cash_values) if cash_values else 0
+        position_value = sum(_to_float(p.get("cur_price")) * _to_float(p.get("qty")) for p in positions)
+        total_eval = cash + position_value if cash or position_value else 0
+        return {"cash": cash, "total_eval": total_eval, "positions": positions, "raw": raw_by_exchange}
 
     def portfolio_balance(self):
         """대시보드/리포트 표시용 국내+미국 잔고 스냅샷을 반환한다."""
@@ -292,12 +388,18 @@ class Trader:
         return self.api.domestic_order(code, qty, "sell", price=0)
 
     def liquidate_all(self):
-        """국내 전체 청산."""
+        """국내/미국 전체 청산."""
         bal = self.safe_domestic_balance()
+        overseas = self.safe_overseas_balance()
         results = []
-        for p in bal["positions"]:
+        for p in bal.get("positions", []):
             res = self.api.domestic_order(p["code"], p["qty"], "sell", price=0)
             results.append((p["code"], res.get("ok")))
+        for p in overseas.get("positions", []):
+            exchange = p.get("exchange", "NAS")
+            price = _to_float(p.get("cur_price")) or _to_float(p.get("avg_price"))
+            res = self.api.overseas_order(p["code"], p["qty"], "sell", price=price, exchange=exchange)
+            results.append((f"{exchange}:{p['code']}", res.get("ok")))
         return results
 
     def portfolio_report(self) -> str:

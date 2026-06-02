@@ -356,6 +356,25 @@ def mode_label(mode):
     return "실전" if mode == "real" else "모의"
 
 
+def risk_state_path(mode) -> str:
+    """모드별 리스크 상태 파일 경로를 반환한다."""
+    safe_mode = "real" if mode == "real" else "paper"
+    return os.path.join(LOG_DIR, f"risk_state_{safe_mode}.json")
+
+
+def clear_token_cache() -> bool:
+    """계좌/모드 변경 시 기존 KIS 토큰 캐시를 삭제한다."""
+    if not os.path.exists(TOKEN_FILE):
+        return False
+    try:
+        os.remove(TOKEN_FILE)
+        log.info("KIS 토큰 캐시 삭제: %s", TOKEN_FILE)
+        return True
+    except OSError as e:
+        log.warning("KIS 토큰 캐시 삭제 실패: %s", e)
+        return False
+
+
 # ===================================================================== #
 #  텔레그램 chat_id 자동 조회 (getUpdates)
 # ===================================================================== #
@@ -415,9 +434,9 @@ class KISApi:
     def __init__(self, s):
         self.s = s
         self.base = s.base_url
-        # 모의투자는 유량이 매우 빡빡 → 초당 2건·간격 0.5s. 실전은 초당 15건.
-        self.limiter = RateLimiter(2, min_interval=0.5) if s.is_paper \
-            else RateLimiter(15, min_interval=0.06)
+        # src.kis_api와 같은 보수적 호출 제한 정책을 사용한다.
+        self.limiter = RateLimiter(3, min_interval=0.4) if s.is_paper \
+            else RateLimiter(15, min_interval=0.07)
         self._token = None
         self._issued = 0.0
         self._load_token()
@@ -964,11 +983,45 @@ class CompositeStrategy:
 #  리스크 관리
 # ===================================================================== #
 class RiskManager:
-    def __init__(self, cfg):
+    def __init__(self, cfg, state_path=None):
         self.cfg = cfg or {}
+        self.state_path = state_path
+        self.state_date = None
         self.day_start = None
         self.peak = None
         self.halted = False
+        self._load_state()
+
+    def _today(self):
+        return datetime.now().strftime("%Y-%m-%d")
+
+    def _load_state(self):
+        if not self.state_path or not os.path.exists(self.state_path):
+            return
+        try:
+            with open(self.state_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.state_date = data.get("date")
+            self.day_start = data.get("day_start_equity")
+            self.peak = data.get("peak_equity")
+            self.halted = bool(data.get("halted", False))
+        except Exception:  # noqa
+            self.state_date = None
+            self.day_start = None
+            self.peak = None
+            self.halted = False
+
+    def _save_state(self):
+        if not self.state_path:
+            return
+        os.makedirs(os.path.dirname(self.state_path), exist_ok=True)
+        with open(self.state_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "date": self.state_date,
+                "day_start_equity": self.day_start,
+                "peak_equity": self.peak,
+                "halted": self.halted,
+            }, f, ensure_ascii=False, indent=2)
 
     def position_size(self, cash, price, candles=None):
         if price <= 0 or cash <= 0:
@@ -1009,21 +1062,33 @@ class RiskManager:
         return n < self.cfg.get("max_positions", 5)
 
     def reset_day(self, eq):
+        self.state_date = self._today()
         self.day_start = eq
+        if self.peak is None or eq > self.peak:
+            self.peak = eq
         self.halted = False
+        self._save_state()
 
     def check_limits(self, eq):
-        if self.day_start is None:
+        today = self._today()
+        if self.state_date != today:
+            self.state_date = today
+            self.day_start = eq
+            self.halted = False
+        elif self.day_start is None:
             self.day_start = eq
         if self.peak is None or eq > self.peak:
             self.peak = eq
+        self._save_state()
         if self.day_start and self.day_start > 0:
             if (eq - self.day_start) / self.day_start * 100 <= -self.cfg.get("daily_loss_limit_pct", 3.0):
                 self.halted = True
+                self._save_state()
                 return "일일손실한도"
         if self.peak and self.peak > 0:
             if (eq - self.peak) / self.peak * 100 <= -self.cfg.get("max_drawdown_pct", 15.0):
                 self.halted = True
+                self._save_state()
                 return "MDD한도"
         return ""
 
@@ -1170,7 +1235,7 @@ class Trader:
         self.s = s
         self.api = KISApi(s)
         self.strategy = CompositeStrategy(s.strategy)
-        self.risk = RiskManager(s.risk)
+        self.risk = RiskManager(s.risk, state_path=risk_state_path(s.mode))
         self.journal = journal or TradeJournal()
         self.notify = notify or (lambda m: None)
         self.auto_enabled = s.engine.get("auto_trade_enabled", True)
@@ -1984,7 +2049,7 @@ class TradingApp:
                   relief="flat", width=12, font=("맑은 고딕", 11, "bold"), cursor="hand2").pack(side="left", padx=6)
         tk.Button(r, text="매도", command=lambda: self.manual("sell"), bg=ACCENT, fg="#000",
                   relief="flat", width=12, font=("맑은 고딕", 11, "bold"), cursor="hand2").pack(side="left", padx=6)
-        tk.Button(r, text="⚠ 국내 전체청산", command=self.liquidate, bg="#888", fg="#000",
+        tk.Button(r, text="⚠ 전체청산", command=self.liquidate, bg="#888", fg="#000",
                   relief="flat", width=16, cursor="hand2").pack(side="right", padx=6)
 
     def _tab_settings(self):
@@ -2111,6 +2176,7 @@ class TradingApp:
 
     def _reload_after_mode_change(self):
         """모드/계좌 변경 뒤 이전 엔진·봇 인스턴스를 버리고 화면을 새 모드로 다시 맞춘다."""
+        token_removed = clear_token_cache()
         if self.trader and self.trader.running:
             self.trader.stop()
         if self.bot and self.bot.is_running:
@@ -2126,6 +2192,8 @@ class TradingApp:
         self._refresh()
         self.refresh_journal()
         self.show_report("daily")
+        if token_removed:
+            self.q.put(("log", "KIS 토큰 캐시 삭제됨 — 새 모드/계좌에서 재발급"))
 
     # ---- 엔진/봇 ---- #
     def _ensure(self):
@@ -2249,7 +2317,7 @@ class TradingApp:
         threading.Thread(target=work, daemon=True).start()
 
     def liquidate(self):
-        if not messagebox.askyesno("전체청산", "국내 보유 종목을 모두 시장가 청산할까요?"):
+        if not messagebox.askyesno("전체청산", "국내/미국 보유 종목을 모두 시장가 청산할까요?"):
             return
         t = self._ensure()
 

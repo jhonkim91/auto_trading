@@ -3,12 +3,19 @@ import os
 import tempfile
 import unittest
 from datetime import datetime
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from autotrader import Settings as GuiSettings
+from autotrader import RiskManager as GuiRiskManager
 from autotrader import TradeJournal
 from autotrader import build_portfolio_snapshot as build_gui_snapshot
 from autotrader import _format_balance_lines
 from src.config import Settings as ModuleSettings
+from src.kis_api import KISApi
+from src.kis_api import KIS_INTERVAL_PAPER, KIS_INTERVAL_REAL, KIS_RATE_PAPER, KIS_RATE_REAL
+from src.risk import RiskManager
+from src.trader import Trader
 from src.trader import build_portfolio_snapshot as build_module_snapshot
 
 
@@ -105,6 +112,196 @@ class PortfolioSnapshotTests(unittest.TestCase):
             self.assertEqual(len([r for r in journal.recent(mode="real") if not r["ok"]]), 1)
             del journal
             gc.collect()
+
+    def test_kis_rate_policy_uses_conservative_shared_limits(self):
+        self.assertEqual(KIS_RATE_PAPER, 3)
+        self.assertEqual(KIS_RATE_REAL, 15)
+        self.assertEqual(KIS_INTERVAL_PAPER, 0.4)
+        self.assertEqual(KIS_INTERVAL_REAL, 0.07)
+
+    def test_risk_manager_applies_trailing_stop_in_profit_only(self):
+        risk = RiskManager(
+            {
+                "stop_loss_pct": 5.0,
+                "take_profit_pct": 10.0,
+                "trailing_stop_pct": 4.0,
+            }
+        )
+        self.assertEqual(risk.should_exit(100, 94, peak_price=110), "stop_loss")
+        self.assertEqual(risk.should_exit(100, 104, peak_price=110), "trailing_stop")
+        self.assertEqual(risk.should_exit(100, 111, peak_price=111), "take_profit")
+        self.assertEqual(risk.should_exit(100, 98, peak_price=110), "")
+
+    def test_module_risk_state_persists_daily_halt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "risk_state_paper.json")
+            cfg = {"daily_loss_limit_pct": 3.0, "max_drawdown_pct": 15.0}
+            risk = RiskManager(cfg, state_path=path)
+
+            self.assertEqual(risk.check_limits(1_000_000), "")
+            self.assertEqual(risk.check_limits(960_000), "daily_loss")
+
+            loaded = RiskManager(cfg, state_path=path)
+            self.assertEqual(loaded.day_start_equity, 1_000_000)
+            self.assertEqual(loaded.peak_equity, 1_000_000)
+            self.assertTrue(loaded.halted)
+
+    def test_gui_risk_state_persists_daily_halt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "risk_state_real.json")
+            cfg = {"daily_loss_limit_pct": 3.0, "max_drawdown_pct": 15.0}
+            risk = GuiRiskManager(cfg, state_path=path)
+
+            self.assertEqual(risk.check_limits(1_000_000), "")
+            self.assertEqual(risk.check_limits(960_000), "일일손실한도")
+
+            loaded = GuiRiskManager(cfg, state_path=path)
+            self.assertEqual(loaded.day_start, 1_000_000)
+            self.assertEqual(loaded.peak, 1_000_000)
+            self.assertTrue(loaded.halted)
+
+    def test_safe_overseas_balance_merges_configured_exchanges_without_cash_duplication(self):
+        class FakeApi:
+            def overseas_balance(self, exchange):
+                balances = {
+                    "NAS": {
+                        "cash": 100,
+                        "positions": [{"code": "QQQ", "qty": 1, "cur_price": 510, "exchange": "NAS"}],
+                    },
+                    "NYS": {
+                        "cash": 100,
+                        "positions": [{"code": "BABA", "qty": 2, "cur_price": 80, "exchange": "NYS"}],
+                    },
+                    "AMS": {"cash": 100, "positions": []},
+                }
+                return balances[exchange]
+
+        trader = Trader.__new__(Trader)
+        trader.s = SimpleNamespace(
+            universe={"overseas": [{"symbol": "QQQ", "exchange": "NAS"}, {"symbol": "BABA", "exchange": "NYS"}]}
+        )
+        trader.api = FakeApi()
+
+        balance = trader.safe_overseas_balance()
+
+        self.assertEqual(balance["cash"], 100)
+        self.assertEqual(balance["total_eval"], 770)
+        self.assertEqual([(p["exchange"], p["code"]) for p in balance["positions"]], [("NAS", "QQQ"), ("NYS", "BABA")])
+
+    def test_liquidate_all_sells_domestic_and_overseas_positions(self):
+        class FakeApi:
+            def __init__(self):
+                self.calls = []
+
+            def domestic_balance(self):
+                return {"positions": [{"code": "005930", "qty": 3}]}
+
+            def overseas_balance(self, exchange):
+                if exchange == "NAS":
+                    return {"cash": 0, "positions": [{"code": "QQQ", "qty": 1, "cur_price": 510, "exchange": "NAS"}]}
+                if exchange == "NYS":
+                    return {"cash": 0, "positions": [{"code": "BABA", "qty": 2, "cur_price": 80, "exchange": "NYS"}]}
+                return {"cash": 0, "positions": []}
+
+            def domestic_order(self, code, qty, side, price=0):
+                self.calls.append(("domestic", code, qty, side, price))
+                return {"ok": True}
+
+            def overseas_order(self, code, qty, side, price=0, exchange="NAS"):
+                self.calls.append(("overseas", exchange, code, qty, side, price))
+                return {"ok": True}
+
+        api = FakeApi()
+        trader = Trader.__new__(Trader)
+        trader.s = SimpleNamespace(
+            universe={"overseas": [{"symbol": "QQQ", "exchange": "NAS"}, {"symbol": "BABA", "exchange": "NYS"}]}
+        )
+        trader.api = api
+
+        results = trader.liquidate_all()
+
+        self.assertEqual(results, [("005930", True), ("NAS:QQQ", True), ("NYS:BABA", True)])
+        self.assertEqual(
+            api.calls,
+            [
+                ("domestic", "005930", 3, "sell", 0),
+                ("overseas", "NAS", "QQQ", 1, "sell", 510),
+                ("overseas", "NYS", "BABA", 2, "sell", 80),
+            ],
+        )
+
+    def test_kis_overseas_buyable_parses_amount_and_quantity(self):
+        calls = []
+        api = KISApi.__new__(KISApi)
+        api.s = SimpleNamespace(is_paper=True, account_no="12345678", account_prod="01")
+
+        def fake_get(path, tr_id, params):
+            calls.append((path, tr_id, params))
+            return {"output": {"ord_psbl_frcr_amt": "1200.50", "ovrs_ord_psbl_qty": "3"}}
+
+        api._get = fake_get
+
+        result = api.overseas_buyable("QQQ", 510, "NAS")
+
+        self.assertEqual(result, {"amount": 1200.50, "qty": 3})
+        self.assertEqual(calls[0][0], "/uapi/overseas-stock/v1/trading/inquire-psamount")
+        self.assertEqual(calls[0][1], "VTTS3007R")
+        self.assertEqual(calls[0][2]["ITEM_CD"], "QQQ")
+
+    def test_overseas_buy_uses_buyable_quantity_cap(self):
+        class FakeApi:
+            def __init__(self):
+                self.orders = []
+
+            def overseas_daily(self, symbol, exchange, count=120):
+                return [{"open": 100, "high": 110, "low": 90, "close": 105, "volume": 1000}] * 40
+
+            def overseas_price(self, symbol, exchange):
+                return {"price": 100, "open": 95}
+
+            def overseas_buyable(self, symbol, price, exchange):
+                return {"amount": 5000, "qty": 3}
+
+            def overseas_order(self, symbol, qty, side, price=0, exchange="NAS"):
+                self.orders.append((symbol, qty, side, price, exchange))
+                return {"ok": True}
+
+        class FakeRisk:
+            def __init__(self):
+                self.cash_seen = None
+
+            def can_open_new(self, current_positions):
+                return True
+
+            def position_size(self, cash, price, candles=None):
+                self.cash_seen = cash
+                return 10
+
+            def should_exit(self, avg_price, cur_price, peak_price=None):
+                return ""
+
+        api = FakeApi()
+        risk = FakeRisk()
+        trader = Trader.__new__(Trader)
+        trader.s = SimpleNamespace(screener={"overseas_use_buyable": True})
+        trader.api = api
+        trader.risk = risk
+        trader.strategy = SimpleNamespace(
+            evaluate=lambda candles, current_price=None, current_open=None: SimpleNamespace(
+                action="buy",
+                reasons=["test"],
+            )
+        )
+        trader.auto_enabled = True
+        trader.last_signals = {}
+        trader._peak = {}
+        trader.notify = lambda msg: None
+
+        with patch("src.trader.log.info"):
+            trader._process_overseas({"symbol": "QQQ", "exchange": "NAS"}, {"cash": 100, "positions": []})
+
+        self.assertEqual(risk.cash_seen, 5000)
+        self.assertEqual(api.orders, [("QQQ", 3, "buy", 100, "NAS")])
 
 
 if __name__ == "__main__":

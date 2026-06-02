@@ -1,7 +1,7 @@
 """한국투자증권 KIS Developers REST API 클라이언트.
 
 - OAuth2 토큰 발급/캐싱(token.dat, 24시간 유효·6시간 주기 갱신)
-- 유량 제어(실전 초당 20건 / 모의 초당 5건, 안전하게 보수적으로 적용)
+- 유량 제어(모의 초당 3건·0.4초 간격 / 실전 초당 15건·0.07초 간격)
 - 국내/해외 시세 조회, 주문(모의=V접두 / 실전=T접두), 잔고 조회
 - 모든 TR_ID 는 폴더 내 리서치 보고서 6항 기준
 """
@@ -21,6 +21,10 @@ log = get_logger("kis")
 
 _TOKEN_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), "token.dat")
 _TOKEN_REFRESH_SEC = 6 * 3600  # 6시간마다 갱신 권장
+KIS_RATE_PAPER = 3
+KIS_RATE_REAL = 15
+KIS_INTERVAL_PAPER = 0.4
+KIS_INTERVAL_REAL = 0.07
 
 
 def _to_float(value) -> float:
@@ -39,16 +43,23 @@ def _first_float(data: dict, keys: tuple) -> float:
 
 
 class RateLimiter:
-    """슬라이딩 윈도우 초당 호출 제한."""
+    """슬라이딩 윈도우와 최소 간격을 함께 적용하는 KIS 호출 제한."""
 
-    def __init__(self, max_per_sec: int):
+    def __init__(self, max_per_sec: int, min_interval: float = 0.0):
         self.max = max_per_sec
+        self.min_interval = min_interval
         self.calls = deque()
+        self.last = 0.0
         self.lock = threading.Lock()
 
     def acquire(self):
         with self.lock:
             now = time.time()
+            if self.min_interval and self.last:
+                gap = now - self.last
+                if gap < self.min_interval:
+                    time.sleep(self.min_interval - gap)
+                    now = time.time()
             while self.calls and now - self.calls[0] > 1.0:
                 self.calls.popleft()
             if len(self.calls) >= self.max:
@@ -58,15 +69,18 @@ class RateLimiter:
                 now = time.time()
                 while self.calls and now - self.calls[0] > 1.0:
                     self.calls.popleft()
-            self.calls.append(time.time())
+            self.last = time.time()
+            self.calls.append(self.last)
 
 
 class KISApi:
     def __init__(self, settings: Settings):
         self.s = settings
         self.base = settings.base_url
-        # 모의=초당5건, 실전=초당20건 → 보수적으로 약간 낮춰 적용
-        self.limiter = RateLimiter(4 if settings.is_paper else 18)
+        self.limiter = RateLimiter(
+            KIS_RATE_PAPER if settings.is_paper else KIS_RATE_REAL,
+            KIS_INTERVAL_PAPER if settings.is_paper else KIS_INTERVAL_REAL,
+        )
         self._token = None
         self._token_issued = 0.0
         self._load_token()
@@ -344,6 +358,33 @@ class KISApi:
         out.reverse()
         return out
 
+    def overseas_buyable(self, symbol: str, price: float, exchange: str = "NAS") -> dict:
+        """해외주식 매수가능금액 조회. 반환: {amount: 주문가능 USD, qty: 주문가능 수량}"""
+        path = "/uapi/overseas-stock/v1/trading/inquire-psamount"
+        tr_id = "VTTS3007R" if self.s.is_paper else "TTTS3007R"
+        params = {
+            "CANO": self.s.account_no,
+            "ACNT_PRDT_CD": self.s.account_prod,
+            "OVRS_EXCG_CD": {"NAS": "NASD", "NYS": "NYSE", "AMS": "AMEX"}.get(exchange, "NASD"),
+            "OVRS_ORD_UNPR": f"{price:.2f}",
+            "ITEM_CD": symbol,
+        }
+        data = self._get(path, tr_id, params)
+        output = data.get("output") or {}
+        if isinstance(output, list):
+            output = output[0] if output else {}
+        amount = _first_float(
+            output,
+            ("ord_psbl_frcr_amt", "frcr_ord_psbl_amt1", "ovrs_ord_psbl_amt"),
+        )
+        qty = int(
+            _first_float(
+                output,
+                ("ovrs_ord_psbl_qty", "ord_psbl_qty", "max_ord_psbl_qty"),
+            )
+        )
+        return {"amount": amount, "qty": qty}
+
     def overseas_order(self, symbol: str, qty: int, side: str,
                        price: float = 0, exchange: str = "NAS") -> dict:
         """미국주식 주문. 해외는 지정가 기준이라 price 필수(0이면 현재가로 대체)."""
@@ -399,14 +440,23 @@ class KISApi:
                     "pnl_amt": float(r.get("frcr_evlu_pfls_amt", 0) or 0),
                     "market": "overseas",
                     "currency": "USD",
+                    "exchange": exchange,
                 }
             )
         summary = data.get("output2") or {}
         if isinstance(summary, list):
             summary = summary[0] if summary else {}
+        log.debug("해외잔고 요약 키(%s): %s", exchange, list((summary or {}).keys()))
         cash = _first_float(
             summary,
-            ("frcr_dncl_amt_2", "frcr_dncl_amt1", "frcr_buy_psbl_amt1"),
+            (
+                "frcr_dncl_amt_2",
+                "frcr_dncl_amt1",
+                "frcr_dncl_amt",
+                "frcr_buy_psbl_amt1",
+                "ovrs_ord_psbl_amt",
+                "ovrs_tot_dncl_amt",
+            ),
         )
         total_eval = _first_float(
             summary,
