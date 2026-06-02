@@ -7,7 +7,7 @@ import unittest
 import numpy as np
 import pandas as pd
 
-from src import costs, metrics, montecarlo as mc, slippage
+from src import costs, metrics, montecarlo as mc, slippage, wfa
 
 
 class CostTests(unittest.TestCase):
@@ -167,6 +167,53 @@ class MonteCarloTests(unittest.TestCase):
         )
 
         self.assertGreater(ror, 0.05)
+
+
+class WFATests(unittest.TestCase):
+    def _make_candles(self, n=120):
+        np.random.seed(7)
+        close = 10000 * np.cumprod(1 + np.random.normal(0.001, 0.015, n))
+        high = close * 1.01
+        low = close * 0.99
+        return [
+            {"open": c * 0.999, "high": h, "low": l, "close": c, "volume": 1000}
+            for c, h, l in zip(close, high, low)
+        ]
+
+    def _simple_backtest(self, candles, params):
+        rng = np.random.default_rng(params.get("seed", 0))
+        returns = rng.normal(0.001, 0.01, len(candles)).tolist()
+        trades = [{"pnl": item * 10000} for item in returns if abs(item) > 0.005]
+        return {
+            "returns": returns,
+            "trades": trades,
+            "sharpe": float(np.mean(returns) / (np.std(returns) or 1)) * np.sqrt(252),
+        }
+
+    def test_wfa_splits_rolling(self):
+        splits = wfa.walk_forward_splits(100, 0.8, 5, anchored=False)
+
+        self.assertEqual(len(splits), 5)
+        for train, test in splits:
+            self.assertGreater(len(train), 0)
+            self.assertGreater(len(test), 0)
+            self.assertLess(train.max(), test.min())
+
+    def test_wfa_splits_anchored_expands(self):
+        splits = wfa.walk_forward_splits(100, 0.8, 4, anchored=True)
+
+        for index in range(1, len(splits)):
+            self.assertGreater(len(splits[index][0]), len(splits[index - 1][0]))
+
+    def test_wfe_ratio(self):
+        self.assertAlmostEqual(wfa.wfe(0.10, 0.06), 0.60)
+        self.assertTrue(np.isnan(wfa.wfe(-0.05, 0.03)))
+
+    def test_run_wfa_insufficient_data_returns_not_calculated(self):
+        candles = self._make_candles(20)
+        result = wfa.run_wfa(candles, [{"seed": 0}], self._simple_backtest, n_windows=6)
+
+        self.assertFalse(result.calculated)
 
 
 if __name__ == "__main__":
