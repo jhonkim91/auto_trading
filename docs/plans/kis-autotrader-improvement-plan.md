@@ -14,14 +14,14 @@
 3. [x] 3차 USD 안정화: 해외 예수금 필드 우선순위 확대, 매수가능금액 기반 해외 포지션 사이징 강화
 4. [x] 4차 운영 안정성: 일일 손실/MDD 상태 영속화(JSON + SQLite `equity_state`)
 5. [x] 5차 문서 대비 보강: 설정 재귀 병합, 국내/미국 스크리너, 종목별 처리 타임아웃, 텔레그램 중지/표시 문구 정리
-6. [ ] 6차 유지보수: `autotrader.py`와 `src/` 중복 축소
+6. [x] 6차 전략 검증 고도화: 보수적 게이트 전략, next-bar 백테스트, 비용/슬리피지, PSR·MC·WFA full validation
 
 ## 이번 구현 범위
-- `src/kis_api.py`의 모의/실전 RateLimiter를 `autotrader.py`와 동일한 정책으로 맞춘다.
-- `src/trader.py.safe_overseas_balance()`가 NAS/NYS/AMS 기본 거래소를 조회하고 중복 포지션을 합친다.
-- `src/trader.py.liquidate_all()`이 국내와 미국 포지션을 모두 청산 대상으로 포함한다.
-- `src/risk.py.should_exit()`에 트레일링 스탑을 추가하고 `src/trader.py`가 보유 고점 `_peak`를 전달한다.
-- 모드 전환 시 `token.dat`를 삭제해 이전 모드 토큰 파일이 남지 않게 한다.
+- `src/strategy.py`를 master로 두고 `autotrader.py`의 중복 전략은 호환 래퍼로 연결한다.
+- 신규 매수는 레짐 필터, ADX, 변동성 돌파/신고가 1차 트리거, 보조 확인을 순서대로 통과해야 한다.
+- `src/backtest.py`를 next-bar 체결로 바꾸고 비용/슬리피지/수익률 곡선/거래별 비용 상세를 반환한다.
+- `src/costs.py`, `src/metrics.py`, `src/slippage.py`, `src/montecarlo.py`, `src/wfa.py`를 추가한다.
+- `run.py backtest <code> --full-validation [--mc-sims N]`로 PSR·MC·WFA 검증을 실행한다.
 
 ## 1차 구현 결과
 - `src/kis_api.py`와 `autotrader.py`의 KIS 호출 제한을 모의 초당 3건/0.4초 간격, 실전 초당 15건/0.07초 간격으로 통일한다.
@@ -58,7 +58,14 @@
 - 텔레그램 `/daily` 명령으로 오늘 매매기록 기준 P&L을 즉시 조회한다.
 - `README.md`에 권장 실행 경로, 모듈 분리형 실행 경로, 최신 유량/전략/전체청산 동작을 반영했다.
 
+## 6차 (이번): 전략 재설계 + 백테스트 검증 프레임워크
+- 핵심 변경: 보수적 게이트 전략, next-bar 체결, full validation
+- 신규 모듈: `costs`, `metrics`, `slippage`, `montecarlo`, `wfa`
+- go/no-go 게이트: PSR > 0.95, WFE > 50%, Probability of Ruin < 5%, 최소 OOS 거래수 30
+- 문서화만 남긴 항목: CPCV/PBO는 다종목 풀링 후 재검토, 분봉 수집은 별도 인프라 필요
+
 ## 이번 범위에서 제외
 - 실제 주문/청산 실행 검증
 - KIS 네트워크 API 실조회
-- `autotrader.py`와 `src/` 중복 구조의 대규모 축소
+- CPCV/PBO 정식 구현
+- 분봉 수집 인프라 구축
