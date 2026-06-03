@@ -39,22 +39,100 @@ def cmd_check():
         print(f"❌ 연결 실패: {e}")
 
 
-def cmd_backtest(code: str):
+def cmd_backtest(code: str, full_validation: bool = False, mc_sims: int = 1000):
     s = load_settings()
     from src.backtest import load_history, run_backtest
-    market = "domestic" if code.isdigit() else "overseas"
+    history_market = "domestic" if code.isdigit() else "overseas"
+    cost_market = "kosdaq" if code.isdigit() else "overseas"
     print(f"{code} 과거 데이터 로딩...")
-    candles = load_history(code, start="2023-01-01", market=market)
+    candles = load_history(code, start="2023-01-01", market=history_market)
     if not candles:
         print("데이터를 가져오지 못했습니다.")
         return
     print(f"{len(candles)}봉 로드. 백테스트 실행...")
-    strategy_cfg = s.strategy_domestic if market == "domestic" else s.strategy_overseas
-    res = run_backtest(candles, strategy_cfg)
+    strategy_cfg = s.strategy_domestic if history_market == "domestic" else s.strategy_overseas
+    res = run_backtest(
+        candles,
+        strategy_cfg,
+        market=cost_market,
+        costs_cfg=s.costs,
+        rf=s.costs.get("risk_free_rate", 0.025),
+    )
     print("\n===== 백테스트 결과 =====")
     for k, v in res.items():
-        print(f"{k:18}: {v}")
+        if k not in ("trades", "equity_curve", "returns", "validation"):
+            print(f"{k:22}: {v}")
+
+    if full_validation:
+        print("\nFull Validation 실행 중... (PSR·MC·WFA 포함, 수 분 소요 가능)")
+        from src.backtest import validate_backtest
+        from src.wfa import param_stability_score, run_wfa
+
+        validation_cfg = dict(s.validation or {})
+        validation_cfg["min_oos_trades"] = max(validation_cfg.get("min_oos_trades", 30), 10)
+        validation = validate_backtest(res, validation_cfg, n_mc_sims=mc_sims)
+
+        print("\n===== Validation 결과 =====")
+        if not validation["calculated"]:
+            print(f"계산 불가: {validation['reason']}")
+        else:
+            print(f"PSR (Sharpe>0 확률) : {validation.get('psr', 'N/A')}")
+            print(f"MC 95% MDD         : {validation.get('mdd_mc_p95', 'N/A')}")
+            print(f"Prob of Ruin       : {validation.get('prob_of_ruin', 'N/A')}")
+            print("\n게이트별 결과:")
+            for gate, info in validation.get("gates", {}).items():
+                icon = "PASS" if info["pass"] else "FAIL"
+                print(f"  {icon} {gate:20} {info['value']} (기준: {info['threshold']})")
+            go = "GO" if validation["go_no_go"] else f"NO-GO ({validation.get('reason', '')})"
+            print(f"\n최종 판정: {go}")
+
+        def _wfa_backtest(sample_candles, params):
+            sample = run_backtest(
+                sample_candles,
+                params,
+                market=cost_market,
+                costs_cfg=s.costs,
+                use_cs_slippage=False,
+                rf=s.costs.get("risk_free_rate", 0.025),
+            )
+            returns = sample.get("returns", [])
+            return {
+                "returns": returns,
+                "trades": sample.get("trades", []),
+                "sharpe": _simple_sharpe(returns),
+                "total_return_pct": sample.get("total_return_pct", 0),
+            }
+
+        wfa_result = run_wfa(
+            candles,
+            [strategy_cfg],
+            _wfa_backtest,
+            min_is_trades=1,
+            min_oos_trades=validation_cfg.get("min_oos_trades", 10),
+        )
+        print("\n===== WFA 결과 =====")
+        if not wfa_result.calculated:
+            print(f"계산 불가: {wfa_result.reason}")
+        else:
+            print(f"WFE                : {wfa_result.wfe}")
+            print(f"OOS 거래수         : {wfa_result.n_oos_trades}")
+            stability = param_stability_score(wfa_result.best_params_history)
+            if stability:
+                print(f"파라미터 안정성    : {stability}")
+
     print("\n※ 과거 성과가 미래를 보장하지 않습니다. 수수료/슬리피지 반영됨.")
+
+
+def _simple_sharpe(returns):
+    """CLI WFA용 간단 Sharpe 계산."""
+    if not returns or len(returns) < 2:
+        return 0.0
+    import math
+
+    mean = sum(returns) / len(returns)
+    variance = sum((value - mean) ** 2 for value in returns) / (len(returns) - 1)
+    std = math.sqrt(variance)
+    return (mean / std * math.sqrt(252)) if std > 0 else 0.0
 
 
 def cmd_run(auto: bool):
@@ -86,9 +164,15 @@ if __name__ == "__main__":
         cmd_check()
     elif args and args[0] == "backtest":
         if len(args) < 2:
-            print("사용법: python run.py backtest <종목코드>")
+            print("사용법: python run.py backtest <종목코드> [--full-validation] [--mc-sims N]")
         else:
-            cmd_backtest(args[1])
+            full_validation = "--full-validation" in args
+            mc_sims = 1000
+            if "--mc-sims" in args:
+                index = args.index("--mc-sims")
+                if index + 1 < len(args):
+                    mc_sims = int(args[index + 1])
+            cmd_backtest(args[1], full_validation=full_validation, mc_sims=mc_sims)
     else:
         auto = "--no-auto" not in args
         cmd_run(auto)
